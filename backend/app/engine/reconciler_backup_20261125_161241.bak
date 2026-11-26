@@ -1,0 +1,380 @@
+"""
+CONCILIA AI - Automatic Accounting Reconciliation Engine
+Deterministic multi-pass reconciliation with Decimal precision, full traceability,
+and configurable rules from settings.
+"""
+import uuid
+from decimal import Decimal
+from typing import List, Dict, Any, Tuple
+from app.config import load_settings
+from app.engine.ai_matcher import are_suppliers_compatible, compute_similarity
+
+def run_reconciliation(
+    job_id: str,
+    raw_transactions: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Executes multi-pass deterministic reconciliation over raw transactions.
+    Rules and tolerances are dynamically loaded from user settings.
+    """
+    settings = load_settings()
+    cent_tol = Decimal(str(settings.get("cent_tolerance", 0.05)))
+    min_similarity = float(settings.get("supplier_similarity_threshold", 0.55))
+    
+    enable_exact = settings.get("enable_exact_match", True)
+    enable_cent = settings.get("enable_cent_difference", True)
+    enable_partial = settings.get("enable_partial_payments", True)
+    enable_grouped = settings.get("enable_grouped_payments", True)
+    enable_reversals = settings.get("enable_reversals", True)
+    enable_duplicates = settings.get("enable_duplicate_detection", True)
+
+    # 1. Initialize transactions with tracking fields and unique IDs
+    transactions: List[Dict[str, Any]] = []
+    for i, t in enumerate(raw_transactions):
+        trans_id = t.get("id") or str(uuid.uuid4())
+        amt = Decimal(str(t["amount"])).quantize(Decimal('0.01'))
+        transactions.append({
+            "id": trans_id,
+            "job_id": job_id,
+            "row_index": t.get("row_index", i),
+            "trans_date": t["trans_date"],
+            "history": t["history"],
+            "trans_type": t["trans_type"], # CREDIT (Invoice) or DEBIT (Payment)
+            "amount": amt,
+            "reported_balance": t.get("reported_balance"),
+            "extracted_nf": t.get("extracted_nf"),
+            "extracted_supplier": t.get("extracted_supplier"),
+            "cleaned_supplier": t.get("cleaned_supplier"),
+            "category": t.get("category"),
+            "status": "EM_ABERTO" if t["trans_type"] == "CREDIT" else "SEM_PROVISAO",
+            "matched_amount": Decimal('0.00'),
+            "remaining_amount": amt,
+            "is_reversal": 0,
+            "is_duplicate": 0,
+            "matched_pairs": []
+        })
+
+    reconciliations: List[Dict[str, Any]] = []
+
+    # 2. PASS 0: Detect Estornos / Reversals & Duplicates
+    if enable_reversals or enable_duplicates:
+        for i, t1 in enumerate(transactions):
+            if t1["remaining_amount"] == 0:
+                continue
+            for j, t2 in enumerate(transactions):
+                if i >= j or t2["remaining_amount"] == 0:
+                    continue
+                # Duplicate detection within same type
+                if enable_duplicates and t1["trans_type"] == t2["trans_type"]:
+                    if (t1["trans_date"] == t2["trans_date"] and
+                        t1["amount"] == t2["amount"] and
+                        t1["extracted_nf"] and t1["extracted_nf"] == t2["extracted_nf"]):
+                        t2["is_duplicate"] = 1
+                # Reversal detection between Credit and Debit
+                elif enable_reversals and t1["trans_type"] != t2["trans_type"]:
+                    hist_rev = "ESTORNO" in t1["history"].upper() or "ESTORNO" in t2["history"].upper() or "CANCELA" in t1["history"].upper()
+                    if hist_rev and t1["amount"] == t2["amount"]:
+                        if t1["extracted_nf"] == t2["extracted_nf"] or are_suppliers_compatible(t1["cleaned_supplier"], t2["cleaned_supplier"], min_similarity):
+                            t1["is_reversal"] = 1
+                            t2["is_reversal"] = 1
+                            t1["status"] = "ESTORNO"
+                            t2["status"] = "ESTORNO"
+                            t1["matched_amount"] = t1["amount"]
+                            t1["remaining_amount"] = Decimal('0.00')
+                            t2["matched_amount"] = t2["amount"]
+                            t2["remaining_amount"] = Decimal('0.00')
+                            reconciliations.append({
+                                "id": str(uuid.uuid4()),
+                                "job_id": job_id,
+                                "match_type": "REVERSAL",
+                                "invoice_trans_id": t1["id"] if t1["trans_type"] == "CREDIT" else t2["id"],
+                                "payment_trans_id": t2["id"] if t1["trans_type"] == "CREDIT" else t1["id"],
+                                "nf": t1["extracted_nf"] or t2["extracted_nf"],
+                                "supplier": t1["extracted_supplier"] or t2["extracted_supplier"],
+                                "invoice_amount": str(t1["amount"] if t1["trans_type"] == "CREDIT" else t2["amount"]),
+                                "payment_amount": str(t2["amount"] if t1["trans_type"] == "CREDIT" else t1["amount"]),
+                                "reconciled_amount": str(t1["amount"]),
+                                "difference": "0.00",
+                                "confidence_score": 1.0,
+                                "status": "CONFIRMED",
+                                "match_notes": "Estorno identificado e compensado mutuamente.",
+                                "created_at": t1["trans_date"]
+                            })
+
+    # Group active credits and debits by NF
+    credits_by_nf: Dict[str, List[Dict[str, Any]]] = {}
+    debits_by_nf: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for t in transactions:
+        nf = t["extracted_nf"]
+        if not nf:
+            continue
+        if t["trans_type"] == "CREDIT":
+            credits_by_nf.setdefault(nf, []).append(t)
+        else:
+            debits_by_nf.setdefault(nf, []).append(t)
+
+    all_nfs = set(credits_by_nf.keys()).union(set(debits_by_nf.keys()))
+
+    # 3. PASS 1: Exact 1-to-1 Matching by NF & Amount
+    if enable_exact:
+        for nf in all_nfs:
+            c_list = [c for c in credits_by_nf.get(nf, []) if c["remaining_amount"] > 0]
+            d_list = [d for d in debits_by_nf.get(nf, []) if d["remaining_amount"] > 0]
+            
+            if len(c_list) == 1 and len(d_list) == 1:
+                cred = c_list[0]
+                deb = d_list[0]
+                
+                sim = compute_similarity(cred["cleaned_supplier"], deb["cleaned_supplier"])
+                
+                if cred["remaining_amount"] == deb["remaining_amount"]:
+                    matched_val = cred["remaining_amount"]
+                    cred["matched_amount"] += matched_val
+                    cred["remaining_amount"] = Decimal('0.00')
+                    cred["status"] = "CONCILIADO"
+                    
+                    deb["matched_amount"] += matched_val
+                    deb["remaining_amount"] = Decimal('0.00')
+                    deb["status"] = "CONCILIADO"
+                    
+                    reconciliations.append({
+                        "id": str(uuid.uuid4()),
+                        "job_id": job_id,
+                        "match_type": "EXACT_1_TO_1",
+                        "invoice_trans_id": cred["id"],
+                        "payment_trans_id": deb["id"],
+                        "nf": nf,
+                        "supplier": cred["extracted_supplier"] or deb["extracted_supplier"],
+                        "invoice_amount": str(cred["amount"]),
+                        "payment_amount": str(deb["amount"]),
+                        "reconciled_amount": str(matched_val),
+                        "difference": "0.00",
+                        "confidence_score": 1.0 if sim >= min_similarity else 0.95,
+                        "status": "CONFIRMED",
+                        "match_notes": f"Conciliação exata 1 para 1 via NF {nf}. Similaridade de fornecedor: {sim*100:.1f}%.",
+                        "created_at": deb["trans_date"]
+                    })
+
+    # 4. PASS 2: Cent Difference Matching by NF (tolerance from settings)
+    if enable_cent and cent_tol > Decimal('0.00'):
+        for nf in all_nfs:
+            c_list = [c for c in credits_by_nf.get(nf, []) if c["remaining_amount"] > 0]
+            d_list = [d for d in debits_by_nf.get(nf, []) if d["remaining_amount"] > 0]
+            
+            if len(c_list) == 1 and len(d_list) == 1:
+                cred = c_list[0]
+                deb = d_list[0]
+                
+                diff = abs(cred["remaining_amount"] - deb["remaining_amount"])
+                if Decimal('0.00') < diff <= cent_tol:
+                    matched_val = min(cred["remaining_amount"], deb["remaining_amount"])
+                    signed_diff = cred["amount"] - deb["amount"]
+                    
+                    cred["matched_amount"] += matched_val
+                    cred["remaining_amount"] = Decimal('0.00')
+                    cred["status"] = "DIVERGENCIA_CENTAVOS"
+                    
+                    deb["matched_amount"] += matched_val
+                    deb["remaining_amount"] = Decimal('0.00')
+                    deb["status"] = "DIVERGENCIA_CENTAVOS"
+                    
+                    reconciliations.append({
+                        "id": str(uuid.uuid4()),
+                        "job_id": job_id,
+                        "match_type": "CENT_DIFFERENCE",
+                        "invoice_trans_id": cred["id"],
+                        "payment_trans_id": deb["id"],
+                        "nf": nf,
+                        "supplier": cred["extracted_supplier"] or deb["extracted_supplier"],
+                        "invoice_amount": str(cred["amount"]),
+                        "payment_amount": str(deb["amount"]),
+                        "reconciled_amount": str(matched_val),
+                        "difference": str(signed_diff),
+                        "confidence_score": 0.98,
+                        "status": "CONFIRMED",
+                        "match_notes": (
+                            f"Conciliado com tolerância de centavos (Diferença: R$ {signed_diff:+.2f}). "
+                            f"Crédito: R$ {cred['amount']} vs Débito: R$ {deb['amount']}."
+                        ),
+                        "created_at": deb["trans_date"]
+                    })
+
+    # 5. PASS 3: Partial and Grouped Payments for same NF
+    for nf in all_nfs:
+        c_list = [c for c in credits_by_nf.get(nf, []) if c["remaining_amount"] > 0]
+        d_list = [d for d in debits_by_nf.get(nf, []) if d["remaining_amount"] > 0]
+        
+        if not c_list or not d_list:
+            continue
+            
+        tot_c = sum(c["remaining_amount"] for c in c_list)
+        tot_d = sum(d["remaining_amount"] for d in d_list)
+        
+        if enable_grouped and tot_c == tot_d and (len(c_list) > 1 or len(d_list) > 1):
+            for cred in c_list:
+                for deb in d_list:
+                    if cred["remaining_amount"] == 0 or deb["remaining_amount"] == 0:
+                        continue
+                    alloc = min(cred["remaining_amount"], deb["remaining_amount"])
+                    cred["matched_amount"] += alloc
+                    cred["remaining_amount"] -= alloc
+                    deb["matched_amount"] += alloc
+                    deb["remaining_amount"] -= alloc
+                    
+                    cred["status"] = "CONCILIADO" if cred["remaining_amount"] == 0 else "PARCIAL"
+                    deb["status"] = "CONCILIADO" if deb["remaining_amount"] == 0 else "PARCIAL"
+                    
+                    reconciliations.append({
+                        "id": str(uuid.uuid4()),
+                        "job_id": job_id,
+                        "match_type": "GROUPED",
+                        "invoice_trans_id": cred["id"],
+                        "payment_trans_id": deb["id"],
+                        "nf": nf,
+                        "supplier": cred["extracted_supplier"] or deb["extracted_supplier"],
+                        "invoice_amount": str(cred["amount"]),
+                        "payment_amount": str(deb["amount"]),
+                        "reconciled_amount": str(alloc),
+                        "difference": "0.00",
+                        "confidence_score": 0.95,
+                        "status": "CONFIRMED",
+                        "match_notes": f"Baixa agrupada/parcial por NF {nf}.",
+                        "created_at": deb["trans_date"]
+                    })
+        elif enable_partial:
+            for cred in c_list:
+                for deb in d_list:
+                    if cred["remaining_amount"] == 0 or deb["remaining_amount"] == 0:
+                        continue
+                    alloc = min(cred["remaining_amount"], deb["remaining_amount"])
+                    cred["matched_amount"] += alloc
+                    cred["remaining_amount"] -= alloc
+                    deb["matched_amount"] += alloc
+                    deb["remaining_amount"] -= alloc
+                    
+                    cred["status"] = "CONCILIADO" if cred["remaining_amount"] == 0 else "PARCIAL"
+                    deb["status"] = "CONCILIADO" if deb["remaining_amount"] == 0 else "PARCIAL"
+                    
+                    reconciliations.append({
+                        "id": str(uuid.uuid4()),
+                        "job_id": job_id,
+                        "match_type": "PARTIAL",
+                        "invoice_trans_id": cred["id"],
+                        "payment_trans_id": deb["id"],
+                        "nf": nf,
+                        "supplier": cred["extracted_supplier"] or deb["extracted_supplier"],
+                        "invoice_amount": str(cred["amount"]),
+                        "payment_amount": str(deb["amount"]),
+                        "reconciled_amount": str(alloc),
+                        "difference": str(cred["amount"] - deb["amount"]),
+                        "confidence_score": 0.90,
+                        "status": "CONFIRMED",
+                        "match_notes": f"Amortização parcial de título via NF {nf}. Saldo restante: R$ {cred['remaining_amount']}.",
+                        "created_at": deb["trans_date"]
+                    })
+
+    # 6. PASS 4: Cross-matching remaining items by Supplier & Exact Value
+    remaining_credits = [t for t in transactions if t["trans_type"] == "CREDIT" and t["remaining_amount"] > 0]
+    remaining_debits = [t for t in transactions if t["trans_type"] == "DEBIT" and t["remaining_amount"] > 0]
+
+    for cred in remaining_credits:
+        if cred["remaining_amount"] == 0:
+            continue
+        for deb in remaining_debits:
+            if deb["remaining_amount"] == 0:
+                continue
+            if cred["remaining_amount"] == deb["remaining_amount"]:
+                sim = compute_similarity(cred["cleaned_supplier"], deb["cleaned_supplier"])
+                if sim >= 0.85:
+                    matched_val = cred["remaining_amount"]
+                    cred["matched_amount"] += matched_val
+                    cred["remaining_amount"] = Decimal('0.00')
+                    cred["status"] = "CONCILIADO"
+                    
+                    deb["matched_amount"] += matched_val
+                    deb["remaining_amount"] = Decimal('0.00')
+                    deb["status"] = "CONCILIADO"
+                    
+                    reconciliations.append({
+                        "id": str(uuid.uuid4()),
+                        "job_id": job_id,
+                        "match_type": "EXACT_1_TO_1",
+                        "invoice_trans_id": cred["id"],
+                        "payment_trans_id": deb["id"],
+                        "nf": cred["extracted_nf"] or deb["extracted_nf"] or "S/N",
+                        "supplier": cred["extracted_supplier"],
+                        "invoice_amount": str(cred["amount"]),
+                        "payment_amount": str(deb["amount"]),
+                        "reconciled_amount": str(matched_val),
+                        "difference": "0.00",
+                        "confidence_score": round(sim, 2),
+                        "status": "CONFIRMED",
+                        "match_notes": f"Conciliação por valor e fornecedor compatível ({sim*100:.0f}% similaridade).",
+                        "created_at": deb["trans_date"]
+                    })
+                    break
+
+    # 7. Final status updates for remaining open items
+    for t in transactions:
+        if t["remaining_amount"] > 0:
+            if t["trans_type"] == "CREDIT":
+                t["status"] = "PARCIAL" if t["matched_amount"] > 0 else "EM_ABERTO"
+            else:
+                t["status"] = "PARCIAL" if t["matched_amount"] > 0 else "SEM_PROVISAO"
+
+    # 8. Compute Summary KPIs
+    tot_credits = sum((t["amount"] for t in transactions if t["trans_type"] == "CREDIT"), Decimal('0.00'))
+    tot_debits = sum((t["amount"] for t in transactions if t["trans_type"] == "DEBIT"), Decimal('0.00'))
+    tot_reconciled = sum((Decimal(r["reconciled_amount"]) for r in reconciliations), Decimal('0.00'))
+    
+    open_invoices = [t for t in transactions if t["trans_type"] == "CREDIT" and t["remaining_amount"] > 0]
+    tot_open_val = sum((t["remaining_amount"] for t in open_invoices), Decimal('0.00'))
+    
+    divergences = [r for r in reconciliations if r["match_type"] == "CENT_DIFFERENCE"]
+    tot_cent_diff = sum((Decimal(d["difference"]) for d in divergences), Decimal('0.00'))
+    
+    unmapped_debits = [t for t in transactions if t["status"] == "SEM_PROVISAO"]
+    tot_unmapped_debits = sum((t["remaining_amount"] for t in unmapped_debits), Decimal('0.00'))
+    
+    # Composição do Saldo Final
+    # Na ausência de saldo anterior (ou quando saldo anterior = 0),
+    # o saldo final exercido é rigorosamente composto por:
+    # (+) Notas em Aberto
+    # (+) Divergências de Centavos
+    # (-) Débitos/Pagamentos sem provisão
+    balance_composition = {
+        "open_invoices_total": str(tot_open_val),
+        "open_invoices_count": len(open_invoices),
+        "cent_differences_total": str(tot_cent_diff),
+        "cent_differences_count": len(divergences),
+        "unmapped_debits_total": str(tot_unmapped_debits),
+        "unmapped_debits_count": len(unmapped_debits),
+        "composed_final_balance": str(tot_open_val + tot_cent_diff - tot_unmapped_debits),
+        "period_net_movement": str(tot_credits - tot_debits)
+    }
+    
+    summary = {
+        "total_transactions": len(transactions),
+        "total_invoices_count": len([t for t in transactions if t["trans_type"] == "CREDIT"]),
+        "total_payments_count": len([t for t in transactions if t["trans_type"] == "DEBIT"]),
+        "total_credits_value": str(tot_credits),
+        "total_debits_value": str(tot_debits),
+        "period_net_movement": str(tot_credits - tot_debits),
+        "total_reconciled_value": str(tot_reconciled),
+        "reconciled_count": len([r for r in reconciliations if r["match_type"] == "EXACT_1_TO_1"]),
+        "cent_differences_count": len(divergences),
+        "cent_differences_total": str(tot_cent_diff),
+        "partial_count": len([t for t in transactions if t["status"] == "PARCIAL"]),
+        "open_invoices_count": len(open_invoices),
+        "total_open_value": str(tot_open_val),
+        "unreconciled_payments_count": len(unmapped_debits),
+        "reconciliation_rate_pct": round(float(tot_reconciled / tot_credits * 100) if tot_credits else 0.0, 2),
+        "balance_composition": balance_composition
+    }
+
+    return {
+        "transactions": transactions,
+        "reconciliations": reconciliations,
+        "summary": summary
+    }

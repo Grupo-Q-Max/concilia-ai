@@ -1,0 +1,425 @@
+
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+import {
+    Sparkles, CheckCircle2, AlertTriangle,
+    RefreshCw, Search, ArrowRight, Loader2
+} from "lucide-react";
+import { api, getSmartSuggestions } from "@/lib/api";
+
+interface Suggestion {
+    id: string;
+    invoice_trans_id: string;
+    payment_trans_id: string;
+    invoice_nf: string;
+    payment_nf: string;
+    invoice_supplier?: string;
+    payment_supplier?: string;
+    invoice_date?: string;
+    payment_date?: string;
+    invoice_history?: string;
+    payment_history?: string;
+    invoice_remaining: string;
+    payment_remaining: string;
+    suggested_amount: string;
+    invoice_after: string;
+    payment_after: string;
+    score: number;
+    reason: string;
+    category: string;
+    ambiguous: boolean;
+    batch_eligible: boolean;
+}
+
+interface Props {
+    revision: number;
+    jobId: string;
+    onRefresh: () => Promise<void>;
+}
+
+const money = (value: string) =>
+    Number(value || 0).toLocaleString("pt-BR", {
+        style: "currency",
+        currency: "BRL"
+    });
+
+const labels: Record<string, string> = {
+    COMPATIVEL: "Compativel",
+    DIVERGENCIA_NF: "Revisar NF",
+    PARCIAL: "Baixa parcial",
+    BAIXA_EVIDENCIA: "Evidencia insuficiente"
+};
+
+export default function SmartSuggestions({
+    jobId, onRefresh, revision
+}: Props) {
+
+    const [items, setItems] = useState<Suggestion[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState("");
+    const [message, setMessage] = useState("");
+    const [filter, setFilter] = useState("TODOS");
+    const [search, setSearch] = useState("");
+    const lock = useRef(false);
+
+
+    // CONCILIA_V5_SAFE_SUGGESTIONS_23E
+
+    const requestV5 = useRef(0);
+
+    async function load() {
+
+        const seq = ++requestV5.current;
+
+        setLoading(true);
+
+        try {
+
+            const data = await getSmartSuggestions(jobId);
+
+            if (seq !== requestV5.current) return;
+
+            if (!Array.isArray(data.items)) {
+                throw new Error(
+                    "Resposta de sugestoes invalida."
+                );
+            }
+
+            setItems(data.items);
+
+        } catch (e) {
+
+            if (seq !== requestV5.current) return;
+
+            setItems([]);
+
+            setError(
+                e instanceof Error
+                    ? e.message
+                    : String(e)
+            );
+
+        } finally {
+
+            if (seq === requestV5.current) {
+                setLoading(false);
+            }
+
+        }
+
+    }
+
+    useEffect(() => {
+
+        void load();
+
+        return () => {
+            requestV5.current++;
+        };
+
+    }, [jobId, revision]);
+
+    async function approve(list: Suggestion[]) {
+        if (lock.current || !list.length) return;
+
+        if (!window.confirm(
+            `Confirmar ${list.length} conciliacao(oes)?`
+        )) return;
+
+        lock.current = true;
+        setBusy(true);
+        setError("");
+        setMessage("");
+
+        let completed = 0;
+
+        try {
+            for (const item of list) {
+
+                const latest = await getSmartSuggestions(jobId);
+
+                const current = (latest.items || []).find(
+                    (s: Suggestion) => s.id === item.id
+                );
+
+                if (!current ||
+                    current.invoice_remaining !== item.invoice_remaining ||
+                    current.payment_remaining !== item.payment_remaining ||
+                    (list.length > 1 && !current.batch_eligible)
+                ) {
+                    throw new Error(
+                        "Os saldos ou candidatos mudaram. Revise as sugestoes."
+                    );
+                }
+
+                const result = await api.manualMatch(
+                    jobId,
+                    item.invoice_trans_id,
+                    item.payment_trans_id,
+                    "Sugestao inteligente aprovada: " + item.reason
+                );
+
+                if (!result.success) {
+                    throw new Error(
+                        result.detail || "Falha ao registrar baixa."
+                    );
+                }
+
+                completed++;
+            }
+
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+
+        } finally {
+            // CONCILIA_V5_AUTO_REFRESH
+            if (completed > 0) {
+                try {
+                    await onRefresh();
+                } catch (e) {
+                    setError(previous =>
+                        previous +
+                        " Baixa registrada, mas os indicadores precisam ser atualizados."
+                    );
+                }
+            }
+
+            await load();
+
+            setMessage(
+                `${completed} conciliacao(oes) registrada(s) de ${list.length}.`
+            );
+
+            lock.current = false;
+            setBusy(false);
+        }
+    }
+
+    const eligible = items.filter(s => s.batch_eligible);
+
+    const visible = items.filter(s => {
+        const q = search.toLowerCase();
+
+        return (
+            (filter === "TODOS" || s.category === filter) &&
+            [
+                s.invoice_nf, s.payment_nf,
+                s.invoice_supplier, s.payment_supplier,
+                s.invoice_history, s.payment_history
+            ].join(" ").toLowerCase().includes(q)
+        );
+    });
+
+    return (
+        <section className="space-y-5">
+
+            <div className="rounded-2xl bg-slate-900 p-6 text-white shadow-lg">
+                <div className="flex items-center gap-3">
+                    <Sparkles className="h-7 w-7 text-sky-400"/>
+                    <div>
+                        <h2 className="text-xl font-bold">
+                            Conciliacao Inteligente
+                        </h2>
+                        <p className="text-sm text-slate-300">
+                            Analise, revise e aprove as baixas sugeridas.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+                {[
+                    ["Sugestoes", items.length],
+                    ["Compativeis", items.filter(
+                        s => s.category === "COMPATIVEL"
+                    ).length],
+                    ["Revisar NF", items.filter(
+                        s => s.category === "DIVERGENCIA_NF"
+                    ).length],
+                    ["Baixas parciais", items.filter(
+                        s => s.category === "PARCIAL"
+                    ).length]
+                ].map(([label, value]) => (
+                    <div key={label}
+                        className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                        <p className="text-xs font-semibold text-slate-500">
+                            {label}
+                        </p>
+                        <p className="mt-2 text-3xl font-bold text-slate-900">
+                            {value}
+                        </p>
+                    </div>
+                ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2 rounded-xl border bg-white px-3 py-2">
+                    <Search className="h-4 w-4 text-slate-400"/>
+                    <input
+                        value={search}
+                        onChange={e => setSearch(e.target.value)}
+                        placeholder="Buscar NF ou fornecedor"
+                        className="bg-transparent text-sm outline-none"
+                    />
+                </div>
+
+                <select
+                    value={filter}
+                    onChange={e => setFilter(e.target.value)}
+                    className="rounded-xl border bg-white px-3 py-2 text-sm"
+                >
+                    <option value="TODOS">Todas as sugestoes</option>
+                    {Object.entries(labels).map(([key, label]) => (
+                        <option key={key} value={key}>{label}</option>
+                    ))}
+                </select>
+
+                <button
+                    disabled={busy || loading}
+                    onClick={() => void load()}
+                    className="flex items-center gap-2 rounded-xl border bg-white px-4 py-2 text-sm font-semibold"
+                >
+                    <RefreshCw className="h-4 w-4"/>
+                    Atualizar
+                </button>
+
+                <button
+                    disabled={busy || loading || !eligible.length}
+                    onClick={() => void approve(eligible)}
+                    className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-bold text-white disabled:opacity-40"
+                >
+                    Aprovar compativeis ({eligible.length})
+                </button>
+            </div>
+
+            {error && (
+                <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                    {error}
+                </div>
+            )}
+
+            {message && (
+                <div className="rounded-xl border bg-white p-4 text-sm">
+                    <p>{message}</p>
+                    <button
+                        disabled={busy}
+                        onClick={() => {
+            void onRefresh().catch(e =>
+                setError(e instanceof Error ? e.message : String(e))
+            );
+        }}
+                        className="mt-3 rounded-lg bg-blue-600 px-4 py-2 font-bold text-white"
+                    >
+                        Atualizar todas as abas
+                    </button>
+                </div>
+            )}
+
+            {loading && (
+                <div className="flex justify-center p-8">
+                    <Loader2 className="h-6 w-6 animate-spin text-blue-600"/>
+                </div>
+            )}
+
+            {!loading && !visible.length && !error && (
+                <div className="rounded-2xl border bg-white p-10 text-center text-slate-500">
+                    Nenhuma sugestao encontrada para este filtro.
+                </div>
+            )}
+
+            {!loading && visible.map(s => (
+                <article key={s.id}
+                    className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                            {s.category === "COMPATIVEL" ?
+                                <CheckCircle2 className="h-5 w-5 text-emerald-600"/> :
+                                <AlertTriangle className="h-5 w-5 text-amber-500"/>
+                            }
+
+                            <span className="font-bold text-slate-800">
+                                {labels[s.category] || s.category}
+                            </span>
+                        </div>
+
+                        <span className="text-xl font-bold text-emerald-700">
+                            {money(s.suggested_amount)}
+                        </span>
+                    </div>
+
+                    <p className="text-sm text-slate-600">{s.reason}</p>
+
+                    <div className="grid gap-3 md:grid-cols-2">
+                        {[
+                            {
+                                label: "Provisao / Credito",
+                                nf: s.invoice_nf,
+                                supplier: s.invoice_supplier,
+                                date: s.invoice_date,
+                                history: s.invoice_history,
+                                value: s.invoice_remaining
+                            },
+                            {
+                                label: "Pagamento / Debito",
+                                nf: s.payment_nf,
+                                supplier: s.payment_supplier,
+                                date: s.payment_date,
+                                history: s.payment_history,
+                                value: s.payment_remaining
+                            }
+                        ].map(t => (
+                            <div key={t.label}
+                                className="space-y-2 rounded-xl bg-slate-50 p-4">
+                                <p className="text-xs font-bold uppercase text-slate-500">
+                                    {t.label}
+                                </p>
+                                <p className="font-bold text-slate-900">
+                                    NF {t.nf}
+                                </p>
+                                <p className="text-sm">{t.supplier}</p>
+                                <p className="text-xs text-slate-500">{t.date}</p>
+                                <p className="break-words text-xs text-slate-600">
+                                    {t.history}
+                                </p>
+                                <p className="font-bold">{money(t.value)}</p>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 rounded-xl border p-3 text-sm">
+                        <div>
+                            <p className="text-slate-500">Saldo da NF apos baixa</p>
+                            <strong>{money(s.invoice_after)}</strong>
+                        </div>
+                        <div>
+                            <p className="text-slate-500">Saldo do pagamento</p>
+                            <strong>{money(s.payment_after)}</strong>
+                        </div>
+                    </div>
+
+                    {s.ambiguous && (
+                        <p className="rounded-lg bg-amber-50 p-3 text-xs font-semibold text-amber-800">
+                            Existem outros candidatos. Confira os historicos antes de aprovar.
+                        </p>
+                    )}
+
+                    <div className="flex justify-end">
+                        <button
+                            disabled={busy || loading || s.category === "BAIXA_EVIDENCIA"}
+                            onClick={() => void approve([s])}
+                            className="flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white hover:bg-blue-700 disabled:opacity-40"
+                        >
+                            Aprovar baixa
+                            <ArrowRight className="h-4 w-4"/>
+                        </button>
+                    </div>
+
+                </article>
+            ))}
+
+        </section>
+    );
+}

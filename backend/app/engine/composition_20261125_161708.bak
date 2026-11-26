@@ -1,0 +1,30 @@
+from decimal import Decimal
+
+
+def money(v):
+    return Decimal(str(v or 0)).quantize(Decimal('0.01'))
+
+
+def composition(job, transactions, opening=None):
+    rows = []
+    def add(kind, value, t):
+        if value:
+            rows.append(dict(kind=kind, value=str(value), date=t.get('trans_date',''), nf=t.get('extracted_nf',''), supplier=t.get('extracted_supplier',''), history=t.get('history',''), original=str(t.get('amount',abs(value)))))
+    initial = money(job['initial_balance'])
+    if opening is None:
+        add('Saldo anterior', initial, {'history':'Saldo anterior sem detalhamento'})
+    else:
+        for t in opening:
+            add('Saldo anterior detalhado', money(t['value']), t)
+    opening_difference = initial - sum((money(t['value']) for t in opening), Decimal(0)) if opening is not None else Decimal(0)
+    if opening_difference:
+        add('Saldo anterior nao detalhado', opening_difference, {'history':'Diferenca entre saldo anterior do razao e planilha complementar; pendente de comprovacao'})
+    for t in transactions:
+        sign = 1 if t['trans_type']=='DEBIT' else -1
+        residual = money(t['remaining_amount'])
+        add('Débito residual' if sign==1 else 'Nota em aberto', sign*residual,t)
+        if t['status']=='DIVERGENCIA_CENTAVOS':
+            add('Divergência de centavos',sign*(money(t['amount'])-money(t['matched_amount'])-residual),t)
+    total=sum((money(r['value']) for r in rows),Decimal('0.00'))
+    reported=money(job['final_reported_balance'])
+    return dict(rows=rows,total=str(total),reported=str(reported),difference=str(total-reported),valid=total==reported and bool(transactions),opening_attached=opening is not None,opening_difference=str(opening_difference),opening_complete=opening is not None and opening_difference==0)

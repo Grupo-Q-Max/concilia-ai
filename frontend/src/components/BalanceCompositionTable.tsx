@@ -1,0 +1,104 @@
+"use client";
+import React, {useState} from "react";
+import {attachOpening} from "@/lib/api";
+import OpeningReconciliation from "@/components/OpeningReconciliation";
+import UndoReconciliation from "@/components/UndoReconciliation";
+export const BalanceCompositionTable: React.FC<{job:any;summary:any;openItems:any[];divergentItems:any[];onOpenAudit:()=>void;onRefresh:()=>Promise<void>;revision:number}> = ({job,summary,onOpenAudit,onRefresh,revision}) => {
+ const [error,setError]=useState(""); const [busy,setBusy]=useState(false); const [search,setSearch]=useState("");
+ const c=summary?.composition_v3;
+ const fmt=(v:any)=>Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"});
+ if(!c)return <div>Composição indisponível.</div>;
+ return <div className="space-y-4 bg-white p-5 rounded-xl"><h2 className="text-xl font-bold">Composição analítica do saldo final</h2><p>Débito positivo; crédito negativo.</p><div className="grid grid-cols-3 gap-4"><div>Saldo do razão<br/><b>{fmt(c.reported)}</b></div><div>Saldo composto<br/><b>{fmt(c.total)}</b></div><div>Diferença<br/><b>{fmt(c.difference)}</b></div></div><p>{c.valid?"Composição matematicamente exata":"Composição divergente — revisar lançamentos"}</p><button onClick={onOpenAudit}>Ver memória de cálculo</button>{Number(job.initial_balance)!==0&&<div className="border p-4 rounded"><b>Saldo anterior: {fmt(job.initial_balance)}</b><p>Aceita Data, Numero, Historico, Valor (com ou sem cabecalho), ou Fornecedor, NF, Emissao, Saldo anterior, Natureza (D/C). Valores positivos.</p><p>{c.opening_attached?"Detalhamento anexado":"Sem detalhamento anterior"}</p>{c.opening_attached && !c.opening_complete && <p className="text-amber-700 font-semibold">Saldo anterior ainda não comprovado: {fmt(c.opening_difference)}. A diferença está demonstrada separadamente.</p>}<input type="file" accept=".xls,.xlsx" disabled={busy} onChange={async e=>{const f=e.target.files?.[0];if(!f)return;setBusy(true);setError("");try{await attachOpening(job.id,f);await onRefresh();}catch(e:any){setError(e.message);}finally{setBusy(false);e.target.value="";}}}/><p>{error}</p></div>}
+    
+    {/* CONCILIA_V5_UNDO_PANEL */}
+    {job?.id && (
+      <UndoReconciliation
+        key={job.id}
+        jobId={job.id}
+        composition={c}
+        onRefresh={onRefresh}
+      />
+    )}
+
+{/* CONCILIA_V5_OPENING_PANEL */}
+    {job?.id && Number(job.initial_balance) !== 0 && (
+      <OpeningReconciliation
+        revision={revision}
+        key={job.id}
+        jobId={job.id}
+        initialBalance={job.initial_balance}
+        composition={c}
+        onRefresh={onRefresh}
+      />
+    )}
+<input className="border p-2" placeholder="Buscar NF, fornecedor ou histórico" value={search} onChange={e=>setSearch(e.target.value)}/><div className="overflow-auto"><table className="w-full text-xs"><thead><tr>{["Origem","Data","NF","Fornecedor","Histórico","Original","Total baixado","Residual D+/C-","Status / Baixas"].map(x=><th key={x} className="p-2 text-left">{x}</th>)}</tr></thead><tbody>{c.rows.filter((r:any)=>JSON.stringify(r).toLowerCase().includes(search.toLowerCase())).map((r:any,i:number)=><tr key={i} className="border-t">{[r.kind,r.date,r.nf,r.supplier,r.history,fmt(r.original),fmt(r.matched_amount || 0),fmt(r.value)].map((x:any,j:number)=><td key={j} className="p-2">{x}</td>)}
+    <td className="p-3 align-top min-w-[180px]">
+        <span className={
+            Number(r.matched_amount || 0) > 0
+            ? "inline-block rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-800"
+            : "inline-block rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-700"
+        }>
+            {Number(r.matched_amount || 0) > 0
+                ? "Parcial"
+                : r.status || r.kind}
+        </span>
+
+        {Number(r.matched_amount || 0) > 0 && (
+            <details className="mt-3">
+                <summary className="cursor-pointer font-semibold text-blue-600">
+                    Consultar baixas
+                </summary>
+
+                <div className="mt-3 min-w-[280px] space-y-3 rounded-xl border p-3">
+                    <div className="text-xs">
+                        <p>Original: <strong>{fmt(r.original)}</strong></p>
+                        <p>Baixado: <strong>{fmt(r.matched_amount)}</strong></p>
+                        <p>Residual: <strong>{fmt(r.value)}</strong></p>
+                    </div>
+
+                    {(c.payment_details || []).filter(
+                        (d:any) =>
+                            r.transaction_id &&
+                            (
+                                d.invoice_trans_id === r.transaction_id ||
+                                d.payment_trans_id === r.transaction_id
+                            )
+                    ).map((d:any, index:number) => (
+                        <div key={d.reconciliation_id || index}
+                            className="rounded-lg border p-3 text-xs space-y-1">
+                            <p className="font-bold text-blue-600">
+                                Baixa {index + 1}
+                            </p>
+                            <p>NF: {d.nf || "S/N"}</p>
+                            <p>Data: {d.payment_date}</p>
+                            <p>Linha do razao: {d.payment_row}</p>
+                            <p>Pagamento: {fmt(d.payment_amount)}</p>
+                            <p className="font-bold text-emerald-600">
+                                Valor utilizado: {fmt(d.reconciled_amount)}
+                            </p>
+                            <p className="break-words">
+                                {d.payment_history}
+                            </p>
+                        </div>
+                    ))}
+
+                    {!(c.payment_details || []).some(
+                        (d:any) =>
+                            r.transaction_id &&
+                            (
+                                d.invoice_trans_id === r.transaction_id ||
+                                d.payment_trans_id === r.transaction_id
+                            )
+                    ) && (
+                        <p className="text-xs text-amber-700">
+                            Baixa sem vinculo individual disponivel.
+                        </p>
+                    )}
+                </div>
+            </details>
+        )}
+    </td>
+    </tr>)}</tbody></table></div></div>;
+};
+
+// CONCILIA_V5_ANALYTICAL

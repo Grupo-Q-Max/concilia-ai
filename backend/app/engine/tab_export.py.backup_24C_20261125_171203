@@ -1,0 +1,109 @@
+from io import BytesIO
+from decimal import Decimal
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+MONEY={'amount','matched_amount','remaining_amount','reported_balance','invoice_amount','payment_amount','reconciled_amount','difference','total_invoiced','total_paid','open_balance','original','value','total','reported','opening_difference','initial_balance','final_reported_balance','Saldo anterior','Debitos','Creditos','Saldo final','credits','debits','total_amt'}
+LABELS={'trans_date':'Data','extracted_nf':'NF','extracted_supplier':'Fornecedor','history':'Historico','amount':'Valor original','remaining_amount':'Saldo residual','matched_amount':'Valor conciliado','kind':'Origem','value':'Residual D+/C-','original':'Valor original','supplier':'Fornecedor','nf':'NF','date':'Data','difference':'Diferenca','opening_difference':'Saldo anterior nao detalhado'}
+
+
+# CONCILIA_V5_EXPORT_LABELS
+LABELS.update({
+    "matched_amount": "Valor baixado",
+    "remaining_amount": "Saldo em aberto",
+    "status": "Situacao",
+    "original": "Valor original",
+    "value": "Saldo contabil D+/C-",
+    "transaction_id": "Identificador do lancamento"
+})
+
+
+# CONCILIA_V5_PAYMENT_LABELS
+LABELS.update({
+    "invoice_date": "Data da provisao",
+    "payment_date": "Data do pagamento",
+    "invoice_amount": "Valor original da NF",
+    "payment_amount": "Valor original do pagamento",
+    "reconciled_amount": "Valor desta baixa",
+    "matched_amount": "Total baixado da NF",
+    "remaining_amount": "Saldo residual da NF",
+    "invoice_history": "Historico da provisao",
+    "payment_history": "Historico do pagamento",
+    "invoice_row": "Linha de origem da NF",
+    "payment_row": "Linha de origem do pagamento",
+    "match_type": "Tipo de conciliacao",
+    "match_notes": "Observacoes"
+})
+
+def make_workbook(sheets):
+    wb=Workbook(); wb.remove(wb.active)
+    for name,rows in sheets.items():
+        ws=wb.create_sheet(name); keys=list(dict.fromkeys(k for r in rows for k in r if k not in ('job_id','file_path','metadata_json','math_explanation')))
+        if not keys: ws.append(['Nenhum registro']); continue
+        ws.append([LABELS.get(k,k) for k in keys]); ws.freeze_panes='A2'
+        for cell in ws[1]: cell.font=Font(bold=True,color='FFFFFF'); cell.fill=PatternFill('solid',fgColor='17365D')
+        for row_index,row in enumerate(rows,2):
+            for i,k in enumerate(keys,1):
+                v=row.get(k); c=ws.cell(row_index,i)
+                if v is None: continue
+                if k in MONEY or k.endswith('_value'):
+                    try: c.value=float(Decimal(str(v))); c.number_format='#,##0.00;[Red](#,##0.00)'; continue
+                    except Exception: pass
+                c.value=v if isinstance(v,(int,float,bool)) else str(v)
+                if isinstance(c.value,str): c.data_type='s'
+        ws.auto_filter.ref=ws.dimensions
+        for i,col in enumerate(ws.columns,1): ws.column_dimensions[get_column_letter(i)].width=min(65,max(14,max(len(str(c.value or '')) for c in col)+2))
+    out=BytesIO(); wb.save(out); out.seek(0); return out
+
+
+# CONCILIA_V5_STATUS_EXPORT
+MONEY.update({
+    "invoice_remaining",
+    "payment_remaining",
+    "invoice_total_matched"
+})
+
+LABELS.update({
+    "display_status": "Situacao atual da baixa",
+    "invoice_remaining": "Saldo residual da NF",
+    "payment_remaining": "Saldo residual do pagamento",
+    "invoice_total_matched": "Total baixado da NF",
+    "paid_percentage": "Percentual baixado (%)",
+    "confidence_score": "Confianca da conciliacao",
+    "invoice_status": "Status da NF",
+    "payment_status": "Status do pagamento"
+})
+
+
+# CONCILIA_V5_SUGGESTION_EXPORT_24B
+
+MONEY.update({
+    "invoice_remaining",
+    "payment_remaining",
+    "suggested_amount",
+    "invoice_after",
+    "payment_after",
+    "eligible_value"
+})
+
+LABELS.update({
+    "category": "Classificacao",
+    "score": "Confianca (0 a 100)",
+    "ambiguous": "Ambigua",
+    "batch_eligible": "Elegivel em lote",
+    "invoice_nf": "NF da provisao",
+    "payment_nf": "NF do pagamento",
+    "invoice_supplier": "Fornecedor da provisao",
+    "payment_supplier": "Fornecedor do pagamento",
+    "invoice_remaining": "Saldo atual da provisao",
+    "payment_remaining": "Saldo atual do pagamento",
+    "suggested_amount": "Valor sugerido para baixa",
+    "invoice_after": "Residual projetado da provisao",
+    "payment_after": "Residual projetado do pagamento",
+    "eligible_value": "Valor potencial elegivel em lote",
+    "reason": "Justificativa",
+    "suggestion_status": "Situacao da sugestao",
+    "invoice_trans_id": "ID da provisao",
+    "payment_trans_id": "ID do pagamento"
+})

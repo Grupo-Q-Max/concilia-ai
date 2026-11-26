@@ -1,0 +1,1179 @@
+"""
+CONCILIA AI - FastAPI Application Routes
+"""
+import os
+import json
+import uuid
+import shutil
+from datetime import datetime
+from decimal import Decimal
+from typing import List, Dict, Any, Optional
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
+
+from app.config import UPLOAD_DIR, EXPORT_DIR, load_settings, save_settings
+from app.database import get_connection
+from app.engine.parser import parse_accounting_ledger
+from app.engine.balance_validator import audit_accounting_balance
+from app.engine.reconciler import run_reconciliation
+from app.engine.exporter import export_reconciliation_excel, export_reconciliation_pdf
+from app.schemas import JobSummaryResponse, ManualMatchRequest
+
+from app.engine.composition import composition, money
+
+
+# CONCILIA_V5_PAYMENT_DETAILS
+def payment_details(transactions, reconciliations):
+    lookup = {t["id"]: t for t in transactions}
+    details = []
+
+    for r in reconciliations:
+        if r.get("status") != "CONFIRMED":
+            continue
+
+        inv = lookup.get(r.get("invoice_trans_id"))
+        pay = lookup.get(r.get("payment_trans_id"))
+
+        if not inv or not pay:
+            continue
+
+        if inv["trans_type"] != "CREDIT" or pay["trans_type"] != "DEBIT":
+            continue
+
+        if inv.get("is_reversal") or pay.get("is_reversal"):
+            continue
+
+        residual = money(inv["remaining_amount"])
+
+        details.append({
+            "nf": inv.get("extracted_nf") or r.get("nf"),
+            "supplier": inv.get("extracted_supplier"),
+            "invoice_date": inv.get("trans_date"),
+            "invoice_amount": str(money(inv["amount"])),
+            "payment_date": pay.get("trans_date"),
+            "payment_amount": str(money(pay["amount"])),
+            "reconciled_amount": str(money(r["reconciled_amount"])),
+            "matched_amount": str(money(inv["matched_amount"])),
+            "remaining_amount": str(residual),
+            "status": "PARCIAL" if residual > 0 else "QUITADO",
+            "invoice_history": inv.get("history"),
+            "payment_history": pay.get("history"),
+            "invoice_row": inv.get("row_index"),
+            "payment_row": pay.get("row_index"),
+            "match_type": r.get("match_type"),
+            "match_notes": r.get("match_notes"),
+            "invoice_trans_id": inv["id"],
+            "payment_trans_id": pay["id"],
+            "reconciliation_id": r["id"]
+        })
+
+    return sorted(
+        details,
+        key=lambda r: (
+            str(r["nf"] or ""),
+            str(r["invoice_trans_id"]),
+            str(r["payment_date"] or "")
+        )
+    )
+
+def current_composition(conn, job):
+    tx = [dict(r) for r in conn.execute("SELECT * FROM transactions WHERE job_id=? ORDER BY row_index", (job["id"],))]
+    opening = conn.execute("SELECT payload FROM opening_compositions WHERE job_id=?", (job["id"],)).fetchone()
+
+    result = composition(
+        job, tx,
+        json.loads(opening[0]) if opening else None
+    )
+
+    reconciliations = [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM reconciliations WHERE job_id=?",
+            (job["id"],)
+        )
+    ]
+
+    result["payment_details"] = payment_details(
+        tx, reconciliations
+    )
+
+    return result
+
+
+# CONCILIA_V5_LIVE_SUMMARY
+def refresh_live_summary(conn, job_id, summary):
+    from decimal import Decimal
+
+    tx = [dict(r) for r in conn.execute(
+        "SELECT * FROM transactions WHERE job_id=?",
+        (job_id,)
+    )]
+
+    rec = [dict(r) for r in conn.execute(
+        "SELECT * FROM reconciliations WHERE job_id=? AND status='CONFIRMED'",
+        (job_id,)
+    )]
+
+    def dec(v):
+        return Decimal(str(v or 0))
+
+    credits = [t for t in tx if t["trans_type"] == "CREDIT"]
+    debits = [t for t in tx if t["trans_type"] == "DEBIT"]
+
+    opened = [t for t in credits if dec(t["remaining_amount"]) > 0]
+    pending = [t for t in debits if dec(t["remaining_amount"]) > 0]
+
+    total_credits = sum((dec(t["amount"]) for t in credits), Decimal(0))
+    total_debits = sum((dec(t["amount"]) for t in debits), Decimal(0))
+
+    total_matched = sum(
+        (dec(t["matched_amount"]) for t in credits),
+        Decimal(0)
+    )
+
+    total_open = sum(
+        (dec(t["remaining_amount"]) for t in opened),
+        Decimal(0)
+    )
+
+    total_pending = sum(
+        (dec(t["remaining_amount"]) for t in pending),
+        Decimal(0)
+    )
+
+    cents = [r for r in rec if r["match_type"] == "CENT_DIFFERENCE"]
+
+    total_cents = sum(
+        (dec(r["difference"]) for r in cents),
+        Decimal(0)
+    )
+
+    summary.update({
+        "total_transactions": len(tx),
+        "total_invoices_count": len(credits),
+        "total_payments_count": len(debits),
+        "total_credits_value": str(total_credits),
+        "total_debits_value": str(total_debits),
+        "total_reconciled_value": str(total_matched),
+        "reconciled_count": len([
+            r for r in rec
+            if r["match_type"] in ("EXACT_1_TO_1", "MANUAL")
+        ]),
+        "open_invoices_count": len(opened),
+        "total_open_value": str(total_open),
+        "unreconciled_payments_count": len(pending),
+        "partial_count": len([
+            t for t in tx if t["status"] == "PARCIAL"
+        ]),
+        "cent_differences_count": len(cents),
+        "cent_differences_total": str(total_cents),
+        "reconciliation_rate_pct": round(
+            float(total_matched / total_credits * 100)
+            if total_credits else 0, 2
+        )
+    })
+
+    summary.setdefault("balance_composition", {}).update({
+        "open_invoices_total": str(total_open),
+        "open_invoices_count": len(opened),
+        "unmapped_debits_total": str(total_pending),
+        "unmapped_debits_count": len(pending),
+        "cent_differences_total": str(total_cents),
+        "cent_differences_count": len(cents)
+    })
+
+    return summary
+
+
+router = APIRouter(prefix="/api")
+
+@router.get("/health")
+def health():
+    return {"status": "ok", "app": "CONCILIA AI", "version": "1.0.0"}
+
+@router.get("/settings")
+def get_system_settings():
+    return load_settings()
+
+@router.post("/settings")
+def update_system_settings(payload: Dict[str, Any]):
+    updated = save_settings(payload)
+    return {"success": True, "settings": updated}
+
+@router.post("/reconciliation/{job_id}/reprocess")
+def reprocess_job(job_id: str):
+    conn = get_connection()
+    job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    job_data = dict(job_row)
+    
+    file_path = str(UPLOAD_DIR / os.path.basename(job_data["file_path"]))
+    if not os.path.exists(file_path):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Arquivo original não encontrado no servidor.")
+        
+    parse_result = parse_accounting_ledger(file_path)
+    metadata = parse_result["metadata"]
+    raw_transactions = parse_result["transactions"]
+    
+    math_audit = audit_accounting_balance(
+        metadata["initial_balance"],
+        metadata["final_reported_balance"],
+        raw_transactions
+    )
+    
+    reconcile_result = run_reconciliation(job_id, raw_transactions)
+    transactions = reconcile_result["transactions"]
+    reconciliations = reconcile_result["reconciliations"]
+    summary = reconcile_result["summary"]
+    
+    with conn:
+        conn.execute("DELETE FROM reconciliations WHERE job_id = ?", (job_id,))
+        conn.execute("DELETE FROM transactions WHERE job_id = ?", (job_id,))
+        
+        conn.execute("""
+        UPDATE jobs SET
+            total_credits = ?, total_debits = ?, period_net_movement = ?,
+            math_validation_status = ?, math_explanation = ?, metadata_json = ?
+        WHERE id = ?
+        """, (
+            str(summary["total_credits_value"]),
+            str(summary["total_debits_value"]),
+            str(summary["period_net_movement"]),
+            math_audit["status"],
+            json.dumps(math_audit, ensure_ascii=False),
+            json.dumps({"summary": summary}, ensure_ascii=False),
+            job_id
+        ))
+        
+        for t in transactions:
+            conn.execute("""
+            INSERT INTO transactions (
+                id, job_id, row_index, trans_date, history, trans_type, amount,
+                reported_balance, extracted_nf, extracted_supplier, cleaned_supplier,
+                category, status, matched_amount, remaining_amount, is_reversal, is_duplicate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                t["id"], job_id, t["row_index"], t["trans_date"], t["history"],
+                t["trans_type"], str(t["amount"]),
+                str(t["reported_balance"]) if t["reported_balance"] is not None else None,
+                t["extracted_nf"], t["extracted_supplier"], t["cleaned_supplier"],
+                t["category"], t["status"], str(t["matched_amount"]),
+                str(t["remaining_amount"]), t["is_reversal"], t["is_duplicate"]
+            ))
+            
+        for r in reconciliations:
+            conn.execute("""
+            INSERT INTO reconciliations (
+                id, job_id, match_type, invoice_trans_id, payment_trans_id, nf,
+                supplier, invoice_amount, payment_amount, reconciled_amount, difference,
+                confidence_score, status, match_notes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r["id"], job_id, r["match_type"], r["invoice_trans_id"],
+                r["payment_trans_id"], r["nf"], r["supplier"],
+                r["invoice_amount"], r["payment_amount"], r["reconciled_amount"],
+                r["difference"], r["confidence_score"], r["status"],
+                r["match_notes"], r["created_at"]
+            ))
+            
+        conn.execute("""
+        INSERT INTO audit_logs (id, job_id, action, details, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            str(uuid.uuid4()), job_id, "REPROCESS_WITH_SETTINGS",
+            f"Reprocessado com novas configurações. {len(transactions)} lançamentos e {len(reconciliations)} conciliações.",
+            datetime.now().isoformat()
+        ))
+    conn.close()
+    return {"success": True, "summary": summary, "math_audit": math_audit}
+
+@router.post("/upload")
+async def upload_and_process_ledger(file: UploadFile = File(...)):
+    """
+    Receives an accounting ledger (.xls, .xlsx, .csv), parses transactions,
+    performs mathematical audit, and runs automatic reconciliation.
+    """
+    job_id = str(uuid.uuid4())
+    filename = file.filename or f"ledger_{job_id}.xls"
+    saved_path = UPLOAD_DIR / f"{job_id}_{filename}"
+    
+    with open(saved_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    try:
+        # 1. Parse ledger
+        parse_result = parse_accounting_ledger(str(saved_path))
+        metadata = parse_result["metadata"]
+        raw_transactions = parse_result["transactions"]
+        
+        # 2. Mathematical Audit
+        math_audit = audit_accounting_balance(
+            metadata["initial_balance"],
+            metadata["final_reported_balance"],
+            raw_transactions
+        )
+        
+        # 3. Reconciliation Engine
+        reconcile_result = run_reconciliation(job_id, raw_transactions)
+        transactions = reconcile_result["transactions"]
+        reconciliations = reconcile_result["reconciliations"]
+        summary = reconcile_result["summary"]
+        
+        # 4. Save into Database
+        conn = get_connection()
+        with conn:
+            conn.execute("""
+            INSERT INTO jobs (
+                id, filename, file_path, created_at, company_name, cnpj, period, account_code,
+                initial_balance, final_reported_balance, total_credits, total_debits,
+                period_net_movement, status, math_validation_status, math_explanation, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                job_id,
+                filename,
+                str(saved_path),
+                datetime.now().isoformat(),
+                metadata["company_name"],
+                metadata["cnpj"],
+                metadata["period"],
+                metadata["account_code"],
+                str(metadata["initial_balance"]),
+                str(metadata["final_reported_balance"]),
+                str(summary["total_credits_value"]),
+                str(summary["total_debits_value"]),
+                str(summary["period_net_movement"]),
+                "PROCESSED",
+                math_audit["status"],
+                json.dumps(math_audit, ensure_ascii=False),
+                json.dumps({"summary": summary}, ensure_ascii=False)
+            ))
+            
+            for t in transactions:
+                conn.execute("""
+                INSERT INTO transactions (
+                    id, job_id, row_index, trans_date, history, trans_type, amount,
+                    reported_balance, extracted_nf, extracted_supplier, cleaned_supplier,
+                    category, status, matched_amount, remaining_amount, is_reversal, is_duplicate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    t["id"],
+                    job_id,
+                    t["row_index"],
+                    t["trans_date"],
+                    t["history"],
+                    t["trans_type"],
+                    str(t["amount"]),
+                    str(t["reported_balance"]) if t["reported_balance"] is not None else None,
+                    t["extracted_nf"],
+                    t["extracted_supplier"],
+                    t["cleaned_supplier"],
+                    t["category"],
+                    t["status"],
+                    str(t["matched_amount"]),
+                    str(t["remaining_amount"]),
+                    t["is_reversal"],
+                    t["is_duplicate"]
+                ))
+                
+            for r in reconciliations:
+                conn.execute("""
+                INSERT INTO reconciliations (
+                    id, job_id, match_type, invoice_trans_id, payment_trans_id, nf,
+                    supplier, invoice_amount, payment_amount, reconciled_amount, difference,
+                    confidence_score, status, match_notes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    r["id"],
+                    job_id,
+                    r["match_type"],
+                    r["invoice_trans_id"],
+                    r["payment_trans_id"],
+                    r["nf"],
+                    r["supplier"],
+                    r["invoice_amount"],
+                    r["payment_amount"],
+                    r["reconciled_amount"],
+                    r["difference"],
+                    r["confidence_score"],
+                    r["status"],
+                    r["match_notes"],
+                    r["created_at"]
+                ))
+                
+            conn.execute("""
+            INSERT INTO audit_logs (id, job_id, action, details, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """, (
+                str(uuid.uuid4()),
+                job_id,
+                "INITIAL_PROCESSING",
+                f"Processados {len(transactions)} lançamentos e {len(reconciliations)} conciliações.",
+                datetime.now().isoformat()
+            ))
+        conn.close()
+        
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": "Arquivo contábil processado e conciliado com sucesso!",
+            "summary": summary,
+            "math_audit": math_audit
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro ao processar razão contábil: {str(e)}")
+
+@router.get("/jobs")
+def list_jobs():
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+    jobs = [dict(r) for r in rows]
+    conn.close()
+    return jobs
+
+@router.get("/reconciliation/{job_id}/summary")
+def get_job_summary(job_id: str):
+    conn = get_connection()
+    job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    job_data = dict(job_row)
+    
+    # Load summary & math audit
+    math_explanation = json.loads(job_data["math_explanation"]) if job_data["math_explanation"] else {}
+    meta = json.loads(job_data["metadata_json"]) if job_data["metadata_json"] else {}
+    summary = refresh_live_summary(conn, job_id, meta.get("summary", {}))
+    summary["composition_v3"] = current_composition(conn, job_data)
+    
+    # Get counts
+    counts = conn.execute("""
+    SELECT 
+        status, COUNT(*) as cnt, SUM(CAST(amount AS REAL)) as total_amt
+    FROM transactions 
+    WHERE job_id = ?
+    GROUP BY status
+    """, (job_id,)).fetchall()
+    
+    # Get monthly evolution
+    monthly_rows = conn.execute("""
+    SELECT 
+        substr(trans_date, 1, 7) as month,
+        SUM(CASE WHEN trans_type = 'CREDIT' THEN CAST(amount AS REAL) ELSE 0 END) as credits,
+        SUM(CASE WHEN trans_type = 'DEBIT' THEN CAST(amount AS REAL) ELSE 0 END) as debits
+    FROM transactions
+    WHERE job_id = ?
+    GROUP BY substr(trans_date, 1, 7)
+    ORDER BY month ASC
+    """, (job_id,)).fetchall()
+    
+    monthly_evolution = [dict(m) for m in monthly_rows]
+    status_distribution = [dict(c) for c in counts]
+    
+    conn.close()
+    return {
+        "job": job_data,
+        "summary": summary,
+        "math_audit": math_explanation,
+        "status_distribution": status_distribution,
+        "monthly_evolution": monthly_evolution
+    }
+
+@router.get("/reconciliation/{job_id}/transactions")
+def get_transactions(
+    job_id: str,
+    trans_type: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None
+):
+    conn = get_connection()
+    query = "SELECT * FROM transactions WHERE job_id = ?"
+    params = [job_id]
+    
+    if trans_type:
+        query += " AND trans_type = ?"
+        params.append(trans_type)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if search:
+        query += " AND (extracted_nf LIKE ? OR extracted_supplier LIKE ? OR history LIKE ?)"
+        s = f"%{search}%"
+        params.extend([s, s, s])
+        
+    query += " ORDER BY row_index ASC"
+    rows = conn.execute(query, params).fetchall()
+    items = [dict(r) for r in rows]
+    conn.close()
+    return items
+
+@router.get("/reconciliation/{job_id}/reconciled")
+def get_reconciled_pairs(job_id: str, match_type: Optional[str] = None):
+    # CONCILIA_V5_REAL_STATUS
+    conn = get_connection()
+
+    try:
+        query = """
+            SELECT r.*,
+                i.remaining_amount AS invoice_remaining,
+                i.matched_amount AS invoice_total_matched,
+                i.status AS invoice_status,
+                p.remaining_amount AS payment_remaining,
+                p.status AS payment_status
+            FROM reconciliations r
+            LEFT JOIN transactions i
+                ON i.id = r.invoice_trans_id
+                AND i.job_id = r.job_id
+            LEFT JOIN transactions p
+                ON p.id = r.payment_trans_id
+                AND p.job_id = r.job_id
+            WHERE r.job_id = ?
+        """
+
+        params = [job_id]
+
+        if match_type:
+            query += " AND r.match_type = ?"
+            params.append(match_type)
+
+        query += " ORDER BY r.nf ASC"
+
+        items = []
+
+        for row in conn.execute(query, params):
+
+            item = dict(row)
+
+            inv_rem = item.get("invoice_remaining")
+            pay_rem = item.get("payment_remaining")
+
+            if item["status"] != "CONFIRMED":
+                status = {
+                    "PENDING_REVIEW": "Pendente",
+                    "REJECTED": "Rejeitado"
+                }.get(item["status"], item["status"])
+
+            elif item["match_type"] == "REVERSAL":
+                status = "Estorno"
+
+            elif item["match_type"] == "CENT_DIFFERENCE":
+                status = "Divergencia de centavos"
+
+            elif inv_rem is None or pay_rem is None:
+                status = "Vinculo a revisar"
+
+            elif (
+                item.get("invoice_status") == "DIVERGENCIA_CENTAVOS"
+                or item.get("payment_status") == "DIVERGENCIA_CENTAVOS"
+            ):
+                status = "Divergencia de centavos"
+
+            elif money(inv_rem) > 0 or money(pay_rem) > 0:
+                status = "Parcial"
+
+            elif money(inv_rem) == 0 and money(pay_rem) == 0:
+                status = "Quitado"
+
+            else:
+                status = "Revisar saldo"
+
+            item["display_status"] = status
+
+            original = money(item.get("invoice_amount"))
+            accumulated = item.get("invoice_total_matched")
+
+            item["paid_percentage"] = (
+                round(float(money(accumulated) / original * 100), 2)
+                if original > 0 and accumulated is not None
+                else None
+            )
+
+            items.append(item)
+
+        return items
+
+    finally:
+        conn.close()
+
+
+@router.get("/reconciliation/{job_id}/open")
+def get_open_invoices(job_id: str):
+    conn = get_connection()
+    rows = conn.execute("""
+    SELECT * FROM transactions 
+    WHERE job_id = ? AND trans_type = 'CREDIT' AND CAST(remaining_amount AS REAL) > 0
+    ORDER BY trans_date ASC
+    """, (job_id,)).fetchall()
+    items = [dict(r) for r in rows]
+    conn.close()
+    return items
+
+@router.get("/reconciliation/{job_id}/divergences")
+def get_divergences(job_id: str):
+    conn = get_connection()
+    # Cent differences and unmapped debits
+    pairs = conn.execute("""
+    SELECT * FROM reconciliations
+    WHERE job_id = ? AND match_type IN ('CENT_DIFFERENCE', 'PARTIAL')
+    ORDER BY nf ASC
+    """, (job_id,)).fetchall()
+    
+    unmapped_debits = conn.execute("""
+    SELECT * FROM transactions
+    WHERE job_id = ? AND trans_type = 'DEBIT' AND status = 'SEM_PROVISAO'
+    ORDER BY trans_date ASC
+    """, (job_id,)).fetchall()
+    
+    conn.close()
+    return {
+        "divergent_pairs": [dict(p) for p in pairs],
+        "unmapped_debits": [dict(u) for u in unmapped_debits]
+    }
+
+@router.get("/reconciliation/{job_id}/supplier-summary")
+def get_supplier_summary(job_id: str):
+    conn = get_connection()
+    rows = conn.execute("""
+    SELECT 
+        extracted_supplier as supplier,
+        SUM(CASE WHEN trans_type = 'CREDIT' THEN CAST(amount AS REAL) ELSE 0 END) as total_invoiced,
+        SUM(CASE WHEN trans_type = 'DEBIT' THEN CAST(amount AS REAL) ELSE 0 END) as total_paid,
+        SUM(CASE WHEN trans_type = 'CREDIT' THEN CAST(remaining_amount AS REAL) ELSE 0 END) as open_balance,
+        COUNT(CASE WHEN trans_type = 'CREDIT' THEN 1 END) as invoices_count
+    FROM transactions
+    WHERE job_id = ?
+    GROUP BY extracted_supplier
+    ORDER BY open_balance DESC, total_invoiced DESC
+    """, (job_id,)).fetchall()
+    items = [dict(r) for r in rows]
+    conn.close()
+    return items
+
+@router.post("/reconciliation/{job_id}/manual-match")
+def manual_match(job_id: str, payload: ManualMatchRequest):
+    from decimal import Decimal
+    from fastapi import HTTPException
+    from datetime import datetime
+    import uuid
+    import logging
+
+    def dec(value):
+        return Decimal(str(value or 0)).quantize(
+            Decimal("0.01")
+        )
+
+    conn = get_connection()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        inv_row = conn.execute(
+            "SELECT * FROM transactions WHERE id=? AND job_id=?",
+            (payload.invoice_trans_id, job_id)
+        ).fetchone()
+
+        pay_row = conn.execute(
+            "SELECT * FROM transactions WHERE id=? AND job_id=?",
+            (payload.payment_trans_id, job_id)
+        ).fetchone()
+
+        if not inv_row or not pay_row:
+            raise HTTPException(
+                404, "Lancamento nao encontrado."
+            )
+
+        inv = dict(inv_row)
+        pay = dict(pay_row)
+
+        if inv["trans_type"] != "CREDIT" or pay["trans_type"] != "DEBIT":
+            raise HTTPException(
+                400, "Selecione um credito e um debito."
+            )
+
+        if any(
+            t.get("is_reversal") or t.get("is_duplicate")
+            for t in (inv, pay)
+        ):
+            raise HTTPException(
+                409, "Estorno ou duplicidade exige revisao."
+            )
+
+        inv_rem = dec(inv["remaining_amount"])
+        pay_rem = dec(pay["remaining_amount"])
+
+        if inv_rem <= 0 or pay_rem <= 0:
+            raise HTTPException(
+                409, "Lancamento ja liquidado. Atualize a tela."
+            )
+
+        existing = conn.execute(
+            """
+            SELECT id FROM reconciliations
+            WHERE job_id=?
+            AND invoice_trans_id=?
+            AND payment_trans_id=?
+            AND status='CONFIRMED'
+            """,
+            (job_id, inv["id"], pay["id"])
+        ).fetchone()
+
+        if existing:
+            raise HTTPException(
+                409, "Esta baixa ja foi registrada."
+            )
+
+        matched = min(inv_rem, pay_rem)
+
+        for t in (inv, pay):
+            remaining = dec(t["remaining_amount"]) - matched
+            accumulated = dec(t["matched_amount"]) + matched
+
+            conn.execute(
+                """
+                UPDATE transactions
+                SET matched_amount=?,
+                    remaining_amount=?,
+                    status=?
+                WHERE id=? AND job_id=?
+                """,
+                (
+                    str(accumulated),
+                    str(remaining),
+                    "CONCILIADO" if remaining == 0 else "PARCIAL",
+                    t["id"],
+                    job_id
+                )
+            )
+
+        rec_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO reconciliations (
+                id, job_id, match_type,
+                invoice_trans_id, payment_trans_id,
+                nf, supplier, invoice_amount,
+                payment_amount, reconciled_amount,
+                difference, confidence_score,
+                status, match_notes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rec_id,
+                job_id,
+                "MANUAL",
+                inv["id"],
+                pay["id"],
+                inv.get("extracted_nf") or pay.get("extracted_nf"),
+                inv.get("extracted_supplier") or pay.get("extracted_supplier"),
+                str(dec(inv["amount"])),
+                str(dec(pay["amount"])),
+                str(matched),
+                str(inv_rem - pay_rem),
+                1.0,
+                "CONFIRMED",
+                getattr(payload, "notes", None) or "Baixa aprovada pelo usuario.",
+                now
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE reconciliations
+            SET status='REJECTED'
+            WHERE job_id=?
+            AND invoice_trans_id=?
+            AND payment_trans_id=?
+            AND status='PENDING_REVIEW'
+            """,
+            (job_id, inv["id"], pay["id"])
+        )
+
+        conn.execute(
+            """
+            INSERT INTO audit_logs (
+                id, job_id, action, details, timestamp
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                job_id,
+                "MANUAL_MATCH",
+                f"Baixa de R$ {matched}. Registro {rec_id}.",
+                now
+            )
+        )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "reconciliation_id": rec_id,
+            "reconciled_amount": str(matched),
+            "invoice_remaining": str(inv_rem - matched),
+            "payment_remaining": str(pay_rem - matched),
+            "refresh_required": True
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        logging.exception("Falha na conciliacao manual V5")
+        raise HTTPException(
+            500,
+            "Nao foi possivel concluir a baixa. Nenhum valor foi alterado."
+        )
+
+    finally:
+        conn.close()
+
+
+@router.get("/reconciliation/{job_id}/export/excel")
+def export_excel(job_id: str):
+    conn = get_connection()
+    job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    job_data = dict(job_row)
+    
+    t_rows = conn.execute("SELECT * FROM transactions WHERE job_id = ? ORDER BY row_index ASC", (job_id,)).fetchall()
+    transactions = []
+    for r in t_rows:
+        d = dict(r)
+        d["amount"] = Decimal(d["amount"])
+        d["matched_amount"] = Decimal(d["matched_amount"])
+        d["remaining_amount"] = Decimal(d["remaining_amount"])
+        transactions.append(d)
+        
+    r_rows = conn.execute("SELECT * FROM reconciliations WHERE job_id = ?", (job_id,)).fetchall()
+    reconciliations = [dict(r) for r in r_rows]
+    
+    math_audit = json.loads(job_data["math_explanation"]) if job_data["math_explanation"] else {}
+    meta = json.loads(job_data["metadata_json"]) if job_data["metadata_json"] else {}
+    summary = refresh_live_summary(conn, job_id, meta.get("summary", {}))
+    summary["composition_v3"] = current_composition(conn, job_data)
+    conn.close()
+    
+    out_file = EXPORT_DIR / f"Conciliacao_AI_{job_id[:8]}.xlsx"
+    export_reconciliation_excel(
+        job_data,
+        transactions,
+        reconciliations,
+        summary,
+        math_audit,
+        str(out_file)
+    )
+    
+    return FileResponse(
+        path=str(out_file),
+        filename=f"CONCILIA_AI_{job_data.get('company_name', 'Relatorio')[:20]}_{job_id[:6]}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+@router.get("/reconciliation/{job_id}/export/pdf")
+def export_pdf(job_id: str):
+    conn = get_connection()
+    job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    job_data = dict(job_row)
+    
+    open_rows = conn.execute("""
+    SELECT * FROM transactions 
+    WHERE job_id = ? AND trans_type = 'CREDIT' AND CAST(remaining_amount AS REAL) > 0
+    ORDER BY trans_date ASC
+    """, (job_id,)).fetchall()
+    open_invoices = [dict(r) for r in open_rows]
+    
+    math_audit = json.loads(job_data["math_explanation"]) if job_data["math_explanation"] else {}
+    meta = json.loads(job_data["metadata_json"]) if job_data["metadata_json"] else {}
+    summary = refresh_live_summary(conn, job_id, meta.get("summary", {}))
+    summary["composition_v3"] = current_composition(conn, job_data)
+    conn.close()
+    
+    out_file = EXPORT_DIR / f"Laudo_Conciliacao_AI_{job_id[:8]}.pdf"
+    export_reconciliation_pdf(
+        job_data,
+        summary,
+        math_audit,
+        open_invoices,
+        str(out_file)
+    )
+    
+    return FileResponse(
+        path=str(out_file),
+        filename=f"Laudo_CONCILIA_AI_{job_id[:6]}.pdf",
+        media_type="application/pdf"
+    )
+
+
+# CONCILIA AI V2 - History management
+@router.delete("/history")
+def delete_history_v2():
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute("DELETE FROM jobs")
+        return {"success": True}
+    finally:
+        conn.close()
+
+
+@router.delete("/history/{job_id}")
+def delete_history_job_v2(job_id: str):
+    conn = get_connection()
+    try:
+        with conn:
+            result = conn.execute(
+                "DELETE FROM jobs WHERE id = ?", (job_id,)
+            )
+            if result.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Documento nao encontrado."
+                )
+        return {"success": True}
+    finally:
+        conn.close()
+
+@router.post("/reconciliation/{job_id}/opening")
+async def attach_opening(job_id: str, file: UploadFile = File(...)):
+    from app.engine.opening_import import read_opening
+    from pathlib import Path
+    import tempfile
+    suffix = Path(file.filename or '').suffix.lower()
+    if suffix not in ('.xls','.xlsx'):
+        raise HTTPException(400, "Use XLS ou XLSX")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/('opening'+suffix)
+            path.write_bytes(await file.read())
+            rows = read_opening(str(path), None)
+    except Exception as exc:
+        raise HTTPException(400, 'Planilha invalida: '+str(exc))
+    conn=get_connection()
+    try:
+        job=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if not job: raise HTTPException(404,'Documento inexistente')
+        # Preserve the original ledger balance; incomplete detail is shown separately.
+        if not money(job['initial_balance']):
+            raise HTTPException(400,'O documento nao possui saldo anterior.')
+        with conn:
+            conn.execute('INSERT OR REPLACE INTO opening_compositions VALUES (?,?)',(job_id,json.dumps(rows,ensure_ascii=False)))
+        return {'success':True}
+    finally: conn.close()
+
+@router.get('/reconciliation/{job_id}/export/tab/{tab}')
+def export_tab(job_id: str, tab: str):
+    from app.engine.tab_export import make_workbook
+    from fastapi.responses import StreamingResponse
+    conn=get_connection()
+    try:
+        job=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if not job: raise HTTPException(404,'Documento inexistente')
+        job=dict(job)
+    finally: conn.close()
+    if tab=='dashboard':
+        data=get_job_summary(job_id)
+        summary=data['summary']
+        sheets={'Resumo':[{'Empresa':job['company_name'],'Periodo':job['period'],'Saldo anterior':job['initial_balance'],'Debitos':job['total_debits'],'Creditos':job['total_credits'],'Saldo final':job['final_reported_balance'],**{k:v for k,v in summary.items() if not isinstance(v,(dict,list))}}], 'Evolucao mensal':data['monthly_evolution'],'Status':data['status_distribution']}
+    elif tab=='composition':
+        c=get_job_summary(job_id)['summary']['composition_v3']
+        sheets={
+            'Resumo': [{k:v for k,v in c.items()
+                        if k not in ('rows','payment_details')}],
+            'Composicao': c['rows'],
+            'Detalhamento das Baixas': c['payment_details']
+        }
+    elif tab=='reconciled': sheets={'Conciliados':get_reconciled_pairs(job_id)}
+    elif tab=='open': sheets={'Notas em aberto':get_open_invoices(job_id)}
+    elif tab=='divergences':
+        d=get_divergences(job_id); sheets={'Divergencias':d['divergent_pairs'],'Debitos sem provisao':d['unmapped_debits']}
+    elif tab=='manual': sheets={'Notas pendentes':get_open_invoices(job_id),'Pagamentos pendentes':get_divergences(job_id)['unmapped_debits']}
+    elif tab=='suppliers': sheets={'Fornecedores':get_supplier_summary(job_id)}
+    elif tab=='history': sheets={'Historico':[{k:j.get(k) for k in ('filename','company_name','cnpj','period','created_at','status','initial_balance','final_reported_balance')} for j in list_jobs()]}
+    else: raise HTTPException(400,'Aba desconhecida')
+    return StreamingResponse(make_workbook(sheets),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="ConciliaAI_{tab}_{job_id[:8]}.xlsx"'})
+
+
+
+# CONCILIA_V5_SUGGESTIONS
+
+def build_suggestions_v5(transactions):
+    from app.engine.reconciler import (
+        v5_reference,
+        v5_supplier_match
+    )
+    from collections import Counter
+
+    active = [
+        t for t in transactions
+        if money(t["remaining_amount"]) > 0
+        and not t.get("is_duplicate")
+        and not t.get("is_reversal")
+    ]
+
+    credits = [
+        t for t in active
+        if t["trans_type"] == "CREDIT"
+    ]
+
+    debits = [
+        t for t in active
+        if t["trans_type"] == "DEBIT"
+    ]
+
+    suggestions = []
+
+    for inv in credits:
+        a = money(inv["remaining_amount"])
+        nf1 = v5_reference(inv)
+
+        for pay in debits:
+            b = money(pay["remaining_amount"])
+            nf2 = v5_reference(pay)
+
+            same_nf = bool(nf1 and nf2 and nf1 == nf2)
+            different_nf = bool(nf1 and nf2 and nf1 != nf2)
+            same_supplier = v5_supplier_match(inv, pay)
+            same_value = a == b
+
+            if same_value and same_nf:
+                score = 100
+                reason = "Mesma NF e mesmo valor"
+                category = "COMPATIVEL"
+
+            elif same_value and different_nf:
+                score = 85 if same_supplier else 60
+                reason = "Valores iguais com NFs diferentes"
+                category = "DIVERGENCIA_NF"
+
+            elif same_value and same_supplier:
+                score = 95
+                reason = "Mesmo fornecedor e valor"
+                category = "COMPATIVEL"
+
+            elif same_nf:
+                score = 90
+                reason = "Mesma NF com possibilidade de baixa parcial"
+                category = "PARCIAL"
+
+            elif same_value:
+                score = 40
+                reason = "Mesmo valor sem outra evidencia"
+                category = "BAIXA_EVIDENCIA"
+
+            else:
+                continue
+
+            suggestions.append({
+                "id": inv["id"] + ":" + pay["id"],
+                "invoice_trans_id": inv["id"],
+                "payment_trans_id": pay["id"],
+                "invoice_nf": nf1 or "S/N",
+                "payment_nf": nf2 or "S/N",
+                "invoice_supplier": inv.get("extracted_supplier"),
+                "payment_supplier": pay.get("extracted_supplier"),
+                "invoice_date": inv.get("trans_date"),
+                "payment_date": pay.get("trans_date"),
+                "invoice_history": inv.get("history"),
+                "payment_history": pay.get("history"),
+                "invoice_remaining": str(a),
+                "payment_remaining": str(b),
+                "suggested_amount": str(min(a,b)),
+                "invoice_after": str(a-min(a,b)),
+                "payment_after": str(b-min(a,b)),
+                "score": score,
+                "reason": reason,
+                "category": category
+            })
+
+    inv_counts = Counter(
+        s["invoice_trans_id"] for s in suggestions
+    )
+
+    pay_counts = Counter(
+        s["payment_trans_id"] for s in suggestions
+    )
+
+    for s in suggestions:
+        s["ambiguous"] = (
+            inv_counts[s["invoice_trans_id"]] > 1
+            or pay_counts[s["payment_trans_id"]] > 1
+        )
+
+        s["batch_eligible"] = (
+            not s["ambiguous"]
+            and s["category"] == "COMPATIVEL"
+            and s["score"] >= 95
+        )
+
+    return sorted(
+        suggestions,
+        key=lambda s: (
+            -s["score"],
+            s["ambiguous"],
+            s["invoice_date"] or "",
+            s["id"]
+        )
+    )
+
+
+@router.get("/reconciliation/{job_id}/suggestions")
+def get_suggestions_v5(job_id: str):
+    conn = get_connection()
+
+    try:
+        job = conn.execute(
+            "SELECT id FROM jobs WHERE id=?",
+            (job_id,)
+        ).fetchone()
+
+        if not job:
+            raise HTTPException(404, "Documento inexistente.")
+
+        transactions = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM transactions WHERE job_id=?",
+                (job_id,)
+            )
+        ]
+
+        items = build_suggestions_v5(transactions)
+
+        return {
+            "items": items,
+            "total": len(items),
+            "compatible": sum(
+                s["category"] == "COMPATIVEL"
+                for s in items
+            ),
+            "divergences": sum(
+                s["category"] == "DIVERGENCIA_NF"
+                for s in items
+            ),
+            "partial": sum(
+                s["category"] == "PARCIAL"
+                for s in items
+            ),
+            "ambiguous": sum(
+                s["ambiguous"] for s in items
+            ),
+            "batch_eligible": sum(
+                s["batch_eligible"] for s in items
+            )
+        }
+
+    finally:
+        conn.close()
+

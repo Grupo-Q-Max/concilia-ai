@@ -1,0 +1,17 @@
+{
+  "cent_tolerance": 0.08,
+  "supplier_similarity_threshold": 0.55,
+  "enable_exact_match": true,
+  "enable_cent_difference": true,
+  "enable_partial_payments": true,
+  "enable_grouped_payments": true,
+  "enable_reversals": true,
+  "enable_duplicate_detection": true,
+  "balance_convention": "AUTO",
+  "ai_provider": "HEURISTIC",
+  "ai_api_key": "",
+  "ai_model": "gpt-4o-mini",
+  "company_display_name": "CONCILIA AI Enterprise",
+  "theme": "navy",
+  "auto_open_browser": true
+}

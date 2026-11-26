@@ -1,0 +1,593 @@
+
+"use client";
+
+import UndoHistory from "@/components/UndoHistory";
+
+import React, {
+  useState,
+  useRef
+} from "react";
+
+import {
+  undoReconciliationV5
+} from "@/lib/api";
+
+type Props = {
+  jobId: string;
+  composition: any;
+  onRefresh: () => Promise<void>;
+};
+
+type PaymentDetail = {
+  reconciliation_id: string;
+  nf?: string;
+  supplier?: string;
+  invoice_date?: string;
+  payment_date?: string;
+  invoice_history?: string;
+  payment_history?: string;
+  invoice_amount?: string;
+  payment_amount?: string;
+  reconciled_amount?: string;
+  matched_amount?: string;
+  remaining_amount?: string;
+  payment_row?: number;
+  invoice_row?: number;
+  match_type?: string;
+  origin?: string;
+};
+
+const fmt = (value: any) =>
+  Number(value || 0).toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL"
+  });
+
+const safeTypes = new Set([
+  "MANUAL",
+  "EXACT_1_TO_1",
+  "PARTIAL",
+  "OPENING"
+]);
+
+const errorText = (e: unknown) =>
+  e instanceof Error ? e.message : String(e);
+
+function originOf(item: PaymentDetail): "CURRENT" | "OPENING" {
+  return item.match_type === "OPENING" ||
+    item.origin === "SALDO_ANTERIOR"
+      ? "OPENING"
+      : "CURRENT";
+}
+
+export default function UndoReconciliation({
+  jobId,
+  composition,
+  onRefresh
+}: Props) {
+
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("ALL");
+  const [limit, setLimit] = useState(30);
+
+  const [selected, setSelected] =
+    useState<PaymentDetail | null>(null);
+
+  const [reason, setReason] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  const [removed, setRemoved] =
+    useState<string[]>([]);
+
+  const lock = useRef(false);
+
+  // CONCILIA_V5_UNDO_HISTORY
+  const [historyRevision, setHistoryRevision] = useState(0);
+
+
+  const details: PaymentDetail[] =
+    Array.isArray(composition?.payment_details)
+      ? composition.payment_details
+      : [];
+
+  const active = details.filter(
+    item => !removed.includes(item.reconciliation_id)
+  );
+
+  const filtered = active.filter(item => {
+
+    if (
+      filter !== "ALL" &&
+      originOf(item) !== filter
+    ) return false;
+
+    const text = [
+      item.nf,
+      item.supplier,
+      item.invoice_history,
+      item.payment_history,
+      item.match_type,
+      item.payment_row
+    ].join(" ").toLowerCase();
+
+    return text.includes(
+      search.trim().toLowerCase()
+    );
+
+  });
+
+  const canUndo = (item: PaymentDetail) =>
+    Boolean(
+      composition?.valid &&
+      item.reconciliation_id &&
+      safeTypes.has(item.match_type || "") &&
+      Number(item.reconciled_amount) > 0
+    );
+
+  const selectItem = (item: PaymentDetail) => {
+
+    if (lock.current || !canUndo(item)) return;
+
+    setSelected(item);
+    setReason("");
+    setConfirmed(false);
+    setError("");
+    setMessage("");
+
+  };
+
+  const executeUndo = async () => {
+
+    if (
+      lock.current ||
+      !selected ||
+      !confirmed ||
+      reason.trim().length < 3 ||
+      !canUndo(selected)
+    ) return;
+
+    const item = selected;
+
+    if (!active.some(
+      r => r.reconciliation_id === item.reconciliation_id
+    )) {
+      setError("Baixa desatualizada. Atualize os dados.");
+      return;
+    }
+
+    lock.current = true;
+
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    try {
+
+      const result = await undoReconciliationV5(
+        jobId,
+        item.reconciliation_id,
+        originOf(item),
+        reason.trim()
+      );
+
+      if (!result.success) {
+        throw new Error(
+          "Desfazimento nao confirmado pelo servidor."
+        );
+      }
+
+      setRemoved(prev => [
+        ...prev,
+        item.reconciliation_id
+      ]);
+
+      setHistoryRevision(v => v + 1);
+
+
+      setSelected(null);
+      setReason("");
+      setConfirmed(false);
+
+      setMessage(
+        "Baixa desfeita: " +
+        fmt(result.restored_amount) +
+        ". Diferenca contabil: " +
+        fmt(result.composition_difference) +
+        ". Operacao registrada na auditoria."
+      );
+
+      try {
+
+        await onRefresh();
+
+      } catch (e) {
+
+        setError(
+          "Desfazimento registrado, mas a tela precisa ser atualizada: " +
+          errorText(e)
+        );
+
+      }
+
+    } catch (e) {
+
+      setError(errorText(e));
+
+    } finally {
+
+      lock.current = false;
+      setBusy(false);
+
+    }
+
+  };
+
+  return (
+
+    <details className="border rounded-xl p-4 space-y-4">
+
+      <summary className="cursor-pointer font-bold">
+
+        Gerenciar baixas registradas ({active.length})
+
+      </summary>
+
+      <p className="text-xs text-slate-500">
+
+        Consulte baixas individuais, inclusive de notas
+        totalmente quitadas. O desfazimento restaura
+        somente o valor da baixa selecionada.
+
+      </p>
+
+      {!composition?.valid && (
+
+        <div className="border border-amber-300 rounded-lg p-3 text-sm text-amber-600">
+
+          Desfazimentos bloqueados enquanto a composicao
+          contabil estiver inconsistente.
+
+        </div>
+
+      )}
+
+      {error && (
+
+        <div
+          role="alert"
+          className="border border-red-300 rounded-lg p-3 text-sm text-red-600"
+        >
+          {error}
+        </div>
+
+      )}
+
+      {message && (
+
+        <div
+          role="status"
+          className="border border-emerald-300 rounded-lg p-3 text-sm text-emerald-600"
+        >
+          {message}
+        </div>
+
+      )}
+
+      <div className="flex flex-wrap gap-2">
+
+        <input
+          value={search}
+          placeholder="Buscar NF, fornecedor ou historico"
+          onChange={e => {
+            setSearch(e.target.value);
+            setLimit(30);
+          }}
+          className="border rounded-lg px-3 py-2 text-sm"
+        />
+
+        <select
+          value={filter}
+          onChange={e => {
+            setFilter(e.target.value);
+            setLimit(30);
+          }}
+          className="border rounded-lg px-3 py-2 text-sm"
+        >
+
+          <option value="ALL">Todas as origens</option>
+          <option value="CURRENT">Exercicio atual</option>
+          <option value="OPENING">Saldo anterior</option>
+
+        </select>
+
+        <button
+          disabled={busy}
+          onClick={async () => {
+
+            if (lock.current) return;
+
+            lock.current = true;
+            setBusy(true);
+            setError("");
+
+            try {
+              await onRefresh();
+            } catch (e) {
+              setError(errorText(e));
+            } finally {
+              lock.current = false;
+              setBusy(false);
+            }
+
+          }}
+          className="border rounded-lg px-3 py-2 text-sm"
+        >
+
+          Atualizar dados
+
+        </button>
+
+      </div>
+
+      {selected && (
+
+        <section className="border border-red-300 rounded-xl p-4 space-y-3">
+
+          <h4 className="font-bold text-red-600">
+
+            Confirmar desfazimento
+
+          </h4>
+
+          <p className="text-sm">
+
+            NF {selected.nf || "S/N"} -
+            {" "}{selected.supplier || "Fornecedor nao identificado"}
+
+          </p>
+
+          <p className="text-xs">
+
+            Pagamento: {selected.payment_date || "-"}
+            {" | Linha "}{selected.payment_row || "-"}
+
+          </p>
+
+          <p className="text-xs break-words">
+
+            {selected.payment_history}
+
+          </p>
+
+          <p className="font-bold text-lg">
+
+            Valor a restaurar: {fmt(selected.reconciled_amount)}
+
+          </p>
+
+          <p className="text-xs">
+
+            O saldo da nota e do pagamento sera restaurado
+            pelo valor desta baixa. As demais baixas serao
+            preservadas se a validacao contabil permitir.
+
+          </p>
+
+          <label className="block text-sm font-semibold">
+
+            Motivo obrigatorio
+
+          </label>
+
+          <textarea
+            disabled={busy}
+            value={reason}
+            maxLength={1000}
+            rows={3}
+            placeholder="Informe o motivo do desfazimento"
+            onChange={e => setReason(e.target.value)}
+            className="border rounded-lg p-3 w-full text-sm"
+          />
+
+          <label className="flex items-center gap-2 text-sm">
+
+            <input
+              type="checkbox"
+              disabled={busy}
+              checked={confirmed}
+              onChange={e => setConfirmed(e.target.checked)}
+            />
+
+            Confirmo a restauracao dos saldos desta baixa.
+
+          </label>
+
+          <div className="flex flex-wrap gap-2">
+
+            <button
+              disabled={
+                busy ||
+                !confirmed ||
+                reason.trim().length < 3 ||
+                !canUndo(selected)
+              }
+              onClick={() => void executeUndo()}
+              className="bg-red-600 hover:bg-red-700 text-white rounded-lg px-4 py-2 text-sm disabled:opacity-40"
+            >
+
+              {busy ? "Processando..." : "Confirmar desfazimento"}
+
+            </button>
+
+            <button
+              disabled={busy}
+              onClick={() => {
+                setSelected(null);
+                setReason("");
+                setConfirmed(false);
+              }}
+              className="border rounded-lg px-4 py-2 text-sm"
+            >
+
+              Cancelar
+
+            </button>
+
+          </div>
+
+        </section>
+
+      )}
+
+      {!filtered.length && (
+
+        <p className="text-sm text-slate-500">
+
+          Nenhuma baixa registrada para este filtro.
+
+        </p>
+
+      )}
+
+      <div className="space-y-3">
+
+        {filtered.slice(0, limit).map(item => (
+
+          <article
+            key={item.reconciliation_id}
+            className="border rounded-lg p-4 space-y-3"
+          >
+
+            <div className="flex flex-wrap justify-between gap-2">
+
+              <div>
+
+                <p className="font-bold">
+
+                  NF {item.nf || "S/N"}
+
+                </p>
+
+                <p className="text-xs">
+
+                  {item.supplier || "Fornecedor nao identificado"}
+
+                </p>
+
+              </div>
+
+              <span className="text-xs font-semibold">
+
+                {originOf(item) === "OPENING"
+                  ? "Saldo anterior"
+                  : "Exercicio atual"}
+
+              </span>
+
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+
+              <div>
+                <p className="text-xs text-slate-500">
+                  Valor original NF
+                </p>
+                <b>{fmt(item.invoice_amount)}</b>
+              </div>
+
+              <div>
+                <p className="text-xs text-slate-500">
+                  Valor desta baixa
+                </p>
+                <b className="text-emerald-600">
+                  {fmt(item.reconciled_amount)}
+                </b>
+              </div>
+
+              <div>
+                <p className="text-xs text-slate-500">
+                  Saldo residual NF
+                </p>
+                <b>{fmt(item.remaining_amount)}</b>
+              </div>
+
+            </div>
+
+            <div className="text-xs space-y-1">
+
+              <p>
+                Data da NF: {item.invoice_date || "-"}
+              </p>
+
+              <p>
+                Pagamento: {item.payment_date || "-"}
+                {" | Linha "}{item.payment_row || "-"}
+              </p>
+
+              <p className="break-words">
+
+                {item.payment_history}
+
+              </p>
+
+              <p>
+
+                Modalidade: {item.match_type || "-"}
+
+              </p>
+
+            </div>
+
+            <button
+              disabled={busy || !canUndo(item)}
+              onClick={() => selectItem(item)}
+              className="border border-red-300 text-red-600 rounded-lg px-3 py-2 text-xs font-semibold disabled:opacity-40"
+            >
+
+              Desfazer baixa
+
+            </button>
+
+            {!safeTypes.has(item.match_type || "") && (
+
+              <p className="text-xs text-amber-600">
+
+                Modalidade protegida. Exige revisao especifica.
+
+              </p>
+
+            )}
+
+          </article>
+
+        ))}
+
+      </div>
+
+      {filtered.length > limit && (
+
+        <button
+          onClick={() => setLimit(v => v + 30)}
+          className="border rounded-lg px-4 py-2 text-sm"
+        >
+
+          Mostrar mais baixas
+
+        </button>
+
+      )}
+
+      <UndoHistory
+        key={jobId}
+        jobId={jobId}
+        revision={historyRevision}
+      />
+
+    </details>
+
+  );
+
+}
