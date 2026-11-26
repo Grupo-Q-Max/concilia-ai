@@ -8,8 +8,69 @@ export const BalanceCompositionTable: React.FC<{job:any;summary:any;openItems:an
  const c=summary?.composition_v3;
  const fmt=(v:any)=>Number(v||0).toLocaleString("pt-BR",{style:"currency",currency:"BRL"});
  if(!c)return <div>Composição indisponível.</div>;
- return <div className="space-y-4 bg-white p-5 rounded-xl"><h2 className="text-xl font-bold">Composição analítica do saldo final</h2><p>Débito positivo; crédito negativo.</p><div className="grid grid-cols-3 gap-4"><div>Saldo do razão<br/><b>{fmt(c.reported)}</b></div><div>Saldo composto<br/><b>{fmt(c.total)}</b></div><div>Diferença<br/><b>{fmt(c.difference)}</b></div></div><p>{c.valid?"Composição matematicamente exata":"Composição divergente — revisar lançamentos"}</p><button onClick={onOpenAudit}>Ver memória de cálculo</button>{Number(job.initial_balance)!==0&&<div className="border p-4 rounded"><b>Saldo anterior: {fmt(job.initial_balance)}</b><p>Aceita Data, Numero, Historico, Valor (com ou sem cabecalho), ou Fornecedor, NF, Emissao, Saldo anterior, Natureza (D/C). Valores positivos.</p><p>{c.opening_attached?"Detalhamento anexado":"Sem detalhamento anterior"}</p>{c.opening_attached && !c.opening_complete && <p className="text-amber-700 font-semibold">Saldo anterior ainda não comprovado: {fmt(c.opening_difference)}. A diferença está demonstrada separadamente.</p>}<input type="file" accept=".xls,.xlsx" disabled={busy} onChange={async e=>{const f=e.target.files?.[0];if(!f)return;setBusy(true);setError("");try{await attachOpening(job.id,f);await onRefresh();}catch(e:any){setError(e.message);}finally{setBusy(false);e.target.value="";}}}/><p>{error}</p></div>}
-    
+ return (
+  <div className="space-y-4 bg-white p-5 rounded-xl">
+    <h2 className="text-xl font-bold">Composição analítica do saldo final</h2>
+    <p className="text-xs text-slate-500">Débito positivo; crédito negativo.</p>
+    <div className="grid grid-cols-3 gap-4">
+      <div>Saldo do razão<br/><b>{fmt(c.reported)}</b></div>
+      <div>Saldo composto<br/><b>{fmt(c.total)}</b></div>
+      <div>Diferença<br/><b>{fmt(c.difference)}</b></div>
+    </div>
+    <p className="text-xs font-semibold">{c.valid ? "Composição matematicamente exata" : "Composição divergente — revisar lançamentos"}</p>
+    <button className="text-xs text-blue-600 underline font-medium" onClick={onOpenAudit}>Ver memória de cálculo</button>
+    {Number(job.initial_balance) !== 0 && (
+      <div className="border border-slate-200 p-4 rounded-xl bg-slate-50/50">
+        <b className="text-sm text-slate-900">Saldo anterior a comprovar: {fmt(job.initial_balance)}</b>
+        <p className="text-xs text-slate-500 mt-1">
+          Aceita Data, Numero, Historico, Valor (com ou sem cabecalho), ou Fornecedor, NF, Emissao, Saldo anterior, Natureza (D/C). Valores positivos.
+        </p>
+        <p className="text-xs font-semibold mt-1.5">
+          {c.opening_attached ? "✓ Detalhamento complementar anexado" : "Sem detalhamento anterior"}
+        </p>
+        {c.opening_attached && !c.opening_complete && (
+          <p className="text-amber-700 font-semibold text-xs mt-1">
+            Saldo anterior ainda não comprovado: {fmt(c.opening_difference)}. A diferença está demonstrada separadamente.
+          </p>
+        )}
+        <div className="mt-3">
+          <input
+            type="file"
+            accept=".xls,.xlsx"
+            disabled={busy}
+            className="text-xs text-slate-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border file:border-slate-300 file:text-xs file:font-semibold file:bg-white file:text-slate-700 hover:file:bg-slate-100 cursor-pointer disabled:opacity-50"
+            onChange={async (e) => {
+              const f = e.target.files?.[0];
+              if (!f) return;
+              setBusy(true);
+              setError("");
+              try {
+                await attachOpening(job.id, f);
+                await onRefresh();
+              } catch (e: any) {
+                setError(e.message || "Erro ao processar planilha de saldo anterior.");
+              } finally {
+                setBusy(false);
+                e.target.value = "";
+              }
+            }}
+          />
+        </div>
+        {busy && (
+          <div className="mt-2.5 flex items-center gap-2 text-blue-700 text-xs font-semibold">
+            <span className="animate-spin inline-block w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full" />
+            <span>Processando e cruzando planilha de saldo anterior...</span>
+          </div>
+        )}
+        {error && (
+          <div className="mt-2.5 p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg flex items-start gap-2">
+            <span className="font-bold text-red-800">⚠️ Erro:</span>
+            <span className="flex-1 whitespace-pre-wrap">{error}</span>
+          </div>
+        )}
+      </div>
+    )}
+
     {/* CONCILIA_V5_UNDO_PANEL */}
     {job?.id && (
       <UndoReconciliation
@@ -98,7 +159,8 @@ export const BalanceCompositionTable: React.FC<{job:any;summary:any;openItems:an
             </details>
         )}
     </td>
-    </tr>)}</tbody></table></div></div>;
+    </tr>)}</tbody></table></div></div>
+  );
 };
 
 // CONCILIA_V5_ANALYTICAL

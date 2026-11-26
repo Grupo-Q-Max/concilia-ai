@@ -2164,23 +2164,45 @@ async def attach_opening(job_id: str, file: UploadFile = File(...)):
     import tempfile
     suffix = Path(file.filename or '').suffix.lower()
     if suffix not in ('.xls','.xlsx'):
-        raise HTTPException(400, "Use XLS ou XLSX")
+        raise HTTPException(400, "Formato não suportado. Por favor, envie uma planilha em formato Excel (.xls ou .xlsx).")
     try:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/('opening'+suffix)
             path.write_bytes(await file.read())
             rows = read_opening(str(path), None)
+            if not rows:
+                raise HTTPException(
+                    400,
+                    f"A planilha '{file.filename}' foi lida, mas nenhum lançamento com valor/data foi identificado. "
+                    "Certifique-se de que o arquivo possui colunas com Data, Histórico e Valor/Crédito."
+                )
+    except HTTPException:
+        raise
     except Exception as exc:
         import logging
         logging.getLogger(__name__).error(f"Erro ao importar planilha de saldo anterior: {exc}", exc_info=True)
-        raise HTTPException(400, f"Planilha complementar invalida: {exc}") from exc
-    conn=get_connection()
+        raise HTTPException(
+            400,
+            f"Erro ao processar a planilha de saldo anterior ({file.filename}): {str(exc)}. "
+            "Verifique se o formato do arquivo é válido."
+        ) from exc
+    conn = get_connection()
     try:
-        job=conn.execute('SELECT * FROM jobs WHERE id=?',(job_id,)).fetchone()
-        if not job: raise HTTPException(404,'Documento inexistente')
+        job = conn.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(
+                404,
+                f"Razão contábil base não encontrado no sistema (ID: {job_id}). "
+                "Para anexar a planilha de saldo anterior, é necessário selecionar ou importar primeiro o Razão Contábil da empresa."
+            )
         # Preserve the original ledger balance; incomplete detail is shown separately.
-        if not money(job['initial_balance']):
-            raise HTTPException(400,'O documento nao possui saldo anterior.')
+        init_val = money(job['initial_balance'])
+        if not init_val or init_val == Decimal('0.00'):
+            raise HTTPException(
+                400,
+                f"O razão contábil selecionado ('{job['company_name']}') possui saldo anterior zerado (R$ 0,00). "
+                "A planilha de saldo anterior só deve ser anexada quando o razão possui saldo inicial a comprovar."
+            )
         with conn:
             conn.execute("BEGIN IMMEDIATE")
 
@@ -2196,11 +2218,11 @@ async def attach_opening(job_id: str, file: UploadFile = File(...)):
             ).fetchone():
                 raise HTTPException(
                     409,
-                    "Existem baixas do saldo anterior. "
-                    "A substituicao da planilha foi bloqueada."
+                    "Já existem baixas vinculadas a este saldo anterior. "
+                    "Para substituir a planilha, primeiro desfaça as baixas já registradas."
                 )
             conn.execute('INSERT OR REPLACE INTO opening_compositions VALUES (?,?)',(job_id,json.dumps(rows,ensure_ascii=False)))
-        return {'success':True}
+        return {'success': True, 'count': len(rows)}
     finally: conn.close()
 
 @router.get('/reconciliation/{job_id}/export/tab/{tab}')
