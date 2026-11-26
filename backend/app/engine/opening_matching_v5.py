@@ -44,8 +44,12 @@ def opening_candidates(opening, transactions):
 
         credits.append(item)
 
-    for t in transactions:
+    # Pre-computa débitos e indexa por valor e por NF para busca O(1)
+    payment_meta = []
+    payments_by_amount = {}
+    payments_by_nf = {}
 
+    for t in transactions:
         if t.get("is_duplicate") or t.get("is_reversal"):
             continue
 
@@ -53,10 +57,26 @@ def opening_candidates(opening, transactions):
             continue
 
         if t["trans_type"] == "DEBIT":
-            payments.append(t)
+            b = money(t["remaining_amount"])
+            nf2 = v5_reference(t)
+            entry = (t, b, nf2)
+            payment_meta.append(entry)
+            payments_by_amount.setdefault(b, []).append(entry)
+            if nf2 and nf2 not in ("S/N", "0"):
+                payments_by_nf.setdefault(nf2, []).append(entry)
 
         elif t["trans_type"] == "CREDIT":
             current_credits.append(t)
+
+    # Pre-indexa créditos do período para verificação rápida de conflitos
+    curr_cred_nfs = set()
+    curr_cred_by_amt = {}
+    for t in current_credits:
+        c_nf = v5_reference(t)
+        if c_nf and c_nf not in ("S/N", "0"):
+            curr_cred_nfs.add(c_nf)
+        c_amt = money(t["remaining_amount"])
+        curr_cred_by_amt.setdefault(c_amt, []).append(t)
 
     candidates = []
 
@@ -65,10 +85,24 @@ def opening_candidates(opening, transactions):
         a = money(inv["remaining_amount"])
         nf1 = v5_reference(inv)
 
-        for pay in payments:
+        # Seleciona apenas pagamentos com mesmo valor ou mesma NF
+        seen_pays = set()
+        cand_pays = []
 
-            b = money(pay["remaining_amount"])
-            nf2 = v5_reference(pay)
+        for entry in payments_by_amount.get(a, []):
+            p = entry[0]
+            if p["id"] not in seen_pays:
+                seen_pays.add(p["id"])
+                cand_pays.append(entry)
+
+        if nf1 and nf1 not in ("S/N", "0"):
+            for entry in payments_by_nf.get(nf1, []):
+                p = entry[0]
+                if p["id"] not in seen_pays:
+                    seen_pays.add(p["id"])
+                    cand_pays.append(entry)
+
+        for pay, b, nf2 in cand_pays:
 
             same_nf = bool(nf1 and nf2 and nf1 == nf2)
             different_nf = bool(nf1 and nf2 and nf1 != nf2)
@@ -98,16 +132,12 @@ def opening_candidates(opening, transactions):
             else:
                 continue
 
-            current_conflict = any(
-                (
-                    v5_reference(t)
-                    and v5_reference(t) == nf2
+            current_conflict = bool(
+                (nf2 and nf2 in curr_cred_nfs)
+                or any(
+                    v5_supplier_match(t, pay)
+                    for t in curr_cred_by_amt.get(b, [])
                 )
-                or (
-                    money(t["remaining_amount"]) == b
-                    and v5_supplier_match(t, pay)
-                )
-                for t in current_credits
             )
 
             matched = min(a, b)

@@ -2355,10 +2355,11 @@ def build_suggestions_v5(transactions):
         if t["trans_type"] == "DEBIT"
     ]
 
-    suggestions = []
-
+    # Pre-computa metadados de créditos
     from app.engine.extractor import extract_fallback_number
+    from app.engine.reconciler import v5_extended_alias
 
+    credit_meta = []
     for inv in credits:
         a = money(inv["remaining_amount"])
         nf1 = v5_reference(inv)
@@ -2366,15 +2367,58 @@ def build_suggestions_v5(transactions):
             fb1 = extract_fallback_number(inv.get("history"))
             if fb1:
                 nf1 = fb1
+        year_c = str(inv.get("trans_date") or "")[:4]
+        alias1 = v5_extended_alias(nf1, year_c)
+        credit_meta.append((inv, a, nf1, alias1))
 
-        for pay in debits:
-            b = money(pay["remaining_amount"])
-            nf2 = v5_reference(pay)
-            if not nf2 or nf2 in ("S/N", "0"):
-                fb2 = extract_fallback_number(pay.get("history"))
-                if fb2:
-                    nf2 = fb2
+    # Indexa débitos por valor e por NF para busca O(1) instantânea
+    debits_by_amount = {}
+    debits_by_nf = {}
+    for pay in debits:
+        b = money(pay["remaining_amount"])
+        nf2 = v5_reference(pay)
+        if not nf2 or nf2 in ("S/N", "0"):
+            fb2 = extract_fallback_number(pay.get("history"))
+            if fb2:
+                nf2 = fb2
+        year_d = str(pay.get("trans_date") or "")[:4]
+        alias2 = v5_extended_alias(nf2, year_d)
 
+        entry = (pay, b, nf2, alias2)
+        debits_by_amount.setdefault(b, []).append(entry)
+        if nf2 and nf2 not in ("S/N", "0"):
+            debits_by_nf.setdefault(nf2, []).append(entry)
+        if alias2:
+            debits_by_nf.setdefault(alias2, []).append(entry)
+
+    suggestions = []
+
+    for inv, a, nf1, alias1 in credit_meta:
+        # Busca apenas débitos candidatos relevantes (mesmo valor, mesma NF ou alias fiscal)
+        candidates_seen = set()
+        candidates = []
+
+        for entry in debits_by_amount.get(a, []):
+            p = entry[0]
+            if p["id"] not in candidates_seen:
+                candidates_seen.add(p["id"])
+                candidates.append(entry)
+
+        if nf1 and nf1 not in ("S/N", "0"):
+            for entry in debits_by_nf.get(nf1, []):
+                p = entry[0]
+                if p["id"] not in candidates_seen:
+                    candidates_seen.add(p["id"])
+                    candidates.append(entry)
+
+        if alias1:
+            for entry in debits_by_nf.get(alias1, []):
+                p = entry[0]
+                if p["id"] not in candidates_seen:
+                    candidates_seen.add(p["id"])
+                    candidates.append(entry)
+
+        for pay, b, nf2, alias2 in candidates:
             same_nf = bool(nf1 and nf2 and nf1 == nf2)
             different_nf = bool(nf1 and nf2 and nf1 != nf2)
             same_supplier = v5_supplier_match(inv, pay)
