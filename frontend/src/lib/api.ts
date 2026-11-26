@@ -515,7 +515,12 @@ export async function deleteHistory(jobId?: string) {
     : `${API_BASE}/history`;
   const response = await fetch(url, { method: "DELETE" });
   if (!response.ok) {
-    throw new Error("Nao foi possivel excluir o documento.");
+    let detail = "Não foi possível excluir o documento.";
+    try {
+      const err = await response.json();
+      if (err.detail) detail = err.detail;
+    } catch {}
+    throw new Error(detail);
   }
   return response.json();
 }

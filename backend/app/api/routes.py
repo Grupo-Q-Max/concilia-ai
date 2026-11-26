@@ -2104,6 +2104,20 @@ def delete_history_v2():
     conn = get_connection()
     try:
         with conn:
+            conn.execute("DELETE FROM reconciliations")
+            try:
+                conn.execute("DELETE FROM opening_matches_v5")
+            except Exception:
+                pass
+            try:
+                conn.execute("DELETE FROM opening_compositions")
+            except Exception:
+                pass
+            try:
+                conn.execute("DELETE FROM audit_logs")
+            except Exception:
+                pass
+            conn.execute("DELETE FROM transactions")
             conn.execute("DELETE FROM jobs")
         return {"success": True}
     finally:
@@ -2115,6 +2129,20 @@ def delete_history_job_v2(job_id: str):
     conn = get_connection()
     try:
         with conn:
+            conn.execute("DELETE FROM reconciliations WHERE job_id = ?", (job_id,))
+            try:
+                conn.execute("DELETE FROM opening_matches_v5 WHERE job_id = ?", (job_id,))
+            except Exception:
+                pass
+            try:
+                conn.execute("DELETE FROM opening_compositions WHERE job_id = ?", (job_id,))
+            except Exception:
+                pass
+            try:
+                conn.execute("DELETE FROM audit_logs WHERE job_id = ?", (job_id,))
+            except Exception:
+                pass
+            conn.execute("DELETE FROM transactions WHERE job_id = ?", (job_id,))
             result = conn.execute(
                 "DELETE FROM jobs WHERE id = ?", (job_id,)
             )
