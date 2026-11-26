@@ -452,14 +452,17 @@ def parse_accounting_ledger(
     cred_col = col_map.get('credit', 3)
     bal_col = col_map.get('balance', 4)
     
-    for row_idx in range(header_idx + 1, len(df)):
-        row = df.iloc[row_idx]
+    df_values = df.values
+    num_cols = df_values.shape[1] if df_values.ndim > 1 else 0
+
+    for row_idx in range(header_idx + 1, len(df_values)):
+        row = df_values[row_idx]
         
-        cell_date = row[date_col] if date_col < len(row) else None
-        cell_hist = row[hist_col] if hist_col < len(row) else None
-        cell_deb = row[deb_col] if deb_col < len(row) else None
-        cell_cred = row[cred_col] if cred_col < len(row) else None
-        cell_bal = row[bal_col] if bal_col < len(row) else None
+        cell_date = row[date_col] if date_col < num_cols else None
+        cell_hist = row[hist_col] if hist_col < num_cols else None
+        cell_deb = row[deb_col] if deb_col < num_cols else None
+        cell_cred = row[cred_col] if cred_col < num_cols else None
+        cell_bal = row[bal_col] if bal_col < num_cols else None
         
         # Check if empty row
         if pd.isna(cell_date) and pd.isna(cell_hist) and pd.isna(cell_deb) and pd.isna(cell_cred):

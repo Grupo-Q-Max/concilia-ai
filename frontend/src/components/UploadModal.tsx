@@ -91,15 +91,51 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     useState<ImportValidationV5 | null>(null);
 
   const [busy, setBusy] = useState("");
+  const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
 
   const request = useRef<AbortController | null>(null);
   const locked = useRef(false);
+  const progressTimer = useRef<NodeJS.Timeout | null>(null);
+
+  const startProgress = (stages: { at: number; label: string }[]) => {
+    if (progressTimer.current) clearInterval(progressTimer.current);
+    setProgress(8);
+    let current = 8;
+    setBusy(stages[0]?.label || "Processando...");
+    progressTimer.current = setInterval(() => {
+      current += Math.floor(Math.random() * 3) + 2;
+      if (current >= 94) {
+        current = 94;
+        if (progressTimer.current) clearInterval(progressTimer.current);
+      }
+      setProgress(current);
+      for (let i = stages.length - 1; i >= 0; i--) {
+        if (current >= stages[i].at) {
+          setBusy(stages[i].label);
+          break;
+        }
+      }
+    }, 240);
+  };
+
+  const finishProgress = () => {
+    if (progressTimer.current) clearInterval(progressTimer.current);
+    setProgress(100);
+    setBusy("Concluído!");
+  };
+
+  const resetProgress = () => {
+    if (progressTimer.current) clearInterval(progressTimer.current);
+    setProgress(0);
+    setBusy("");
+  };
 
   useEffect(() => {
 
     if (!isOpen && !locked.current) {
       request.current?.abort();
+      resetProgress();
 
       setFile(null);
       setStep(0);
@@ -107,12 +143,12 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       setMapping({});
       setHeaderRow(1);
       setValidation(null);
-      setBusy("");
       setError("");
     }
 
     return () => {
       request.current?.abort();
+      if (progressTimer.current) clearInterval(progressTimer.current);
     };
 
   }, [isOpen]);
@@ -190,7 +226,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     request.current = controller;
 
-    setBusy("Analisando planilha...");
+    startProgress([
+      { at: 10, label: "Lendo estrutura da planilha..." },
+      { at: 40, label: "Identificando cabeçalhos e colunas..." },
+      { at: 75, label: "Decodificando prévia dos lançamentos..." }
+    ]);
     setError("");
     setValidation(null);
 
@@ -203,6 +243,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       );
 
       if (controller.signal.aborted) return;
+
+      finishProgress();
+      await new Promise(r => setTimeout(r, 200));
 
       setPreview(result);
       setHeaderRow(result.header_row + 1);
@@ -233,6 +276,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     } catch (err) {
 
+      resetProgress();
       if (!controller.signal.aborted) {
         setError(
           err instanceof Error
@@ -243,7 +287,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     } finally {
       locked.current = false;
-      setBusy("");
+      resetProgress();
     }
   };
 
@@ -293,7 +337,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     request.current = controller;
 
-    setBusy("Validando contabilidade...");
+    startProgress([
+      { at: 10, label: "Validando mapeamento de colunas..." },
+      { at: 40, label: "Conferindo datas, débitos e créditos..." },
+      { at: 75, label: "Auditando equação matemática e saldos..." }
+    ]);
     setValidation(null);
     setError("");
 
@@ -314,11 +362,15 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         );
       }
 
+      finishProgress();
+      await new Promise(r => setTimeout(r, 200));
+
       setValidation(result);
       setStep(2);
 
     } catch (err) {
 
+      resetProgress();
       if (!controller.signal.aborted) {
         setError(
           err instanceof Error
@@ -329,7 +381,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     } finally {
       locked.current = false;
-      setBusy("");
+      resetProgress();
     }
   };
 
@@ -343,7 +395,13 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
     locked.current = true;
 
-    setBusy("Importando e conciliando...");
+    startProgress([
+      { at: 10, label: "Enviando planilha para o servidor..." },
+      { at: 28, label: "Lendo milhares de lançamentos contábeis..." },
+      { at: 50, label: "Extraindo NFs e normalizando fornecedores..." },
+      { at: 72, label: "Executando conciliação inteligente e auditoria..." },
+      { at: 88, label: "Finalizando estrutura e gravando conciliação..." }
+    ]);
     setError("");
 
     let importedJob: string | null = null;
@@ -356,9 +414,12 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       );
 
       importedJob = result.job_id;
+      finishProgress();
+      await new Promise(r => setTimeout(r, 350));
 
     } catch (err) {
 
+      resetProgress();
       setError(
         err instanceof Error
           ? err.message
@@ -368,7 +429,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     } finally {
 
       locked.current = false;
-      setBusy("");
+      resetProgress();
     }
 
     if (importedJob) {
@@ -837,6 +898,29 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
         </main>
 
+        {busy && (
+          <div className="px-6 py-4 bg-slate-50 border-t border-slate-200">
+            <div className="flex items-center justify-between text-xs font-semibold text-slate-700 mb-2">
+              <span className="flex items-center gap-2 text-slate-800">
+                <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />
+                <span>{busy}</span>
+              </span>
+              <span className="text-blue-700 font-bold text-sm bg-blue-100 px-2.5 py-0.5 rounded-full">
+                {progress}%
+              </span>
+            </div>
+            <div className="w-full bg-slate-200 rounded-full h-3 overflow-hidden shadow-inner">
+              <div
+                className="bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500 h-full rounded-full transition-all duration-300 ease-out"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <p className="text-[11px] text-slate-500 mt-1.5 text-center">
+              Processando e auditando milhares de lançamentos contábeis. Por favor, aguarde...
+            </p>
+          </div>
+        )}
+
         <footer className="p-5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
 
           <button
@@ -870,7 +954,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               className="flex items-center gap-2 text-blue-700 font-semibold text-sm"
             >
               <Loader2 className="w-5 h-5 animate-spin" />
-              {busy}
+              <span>Processando... ({progress}%)</span>
             </div>
 
           ) : step === 0 ? (
