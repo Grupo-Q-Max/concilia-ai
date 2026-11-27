@@ -50,13 +50,20 @@ def composition(job, transactions, opening=None):
             "Nota em aberto",
             "D\u00e9bito residual",
             "Nota parcialmente baixada",
-            "Pagamento parcialmente utilizado"
+            "Nota parcialmente baixada (Cr\u00e9dito)",
+            "Pagamento parcialmente utilizado",
+            "Pagamento parcialmente utilizado (D\u00e9bito)"
         ):
             row["status"] = (
                 "PARCIALMENTE CONCILIADO"
                 if matched > 0
                 else "EM ABERTO"
             )
+        elif kind in (
+            "Baixa parcial vinculada (D\u00e9bito)",
+            "Provis\u00e3o vinculada \u00e0 baixa (Cr\u00e9dito)"
+        ):
+            row["status"] = "BAIXA PARCIAL REGISTRADA"
 
         rows.append(row)
 

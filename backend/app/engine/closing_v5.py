@@ -42,18 +42,24 @@ def closing_summary_v5(job, composition):
             "saldo anterior",
             "saldo anterior detalhado",
             "saldo anterior parcialmente baixado",
+            "saldo anterior parcialmente baixado (credito)",
+            "baixa parcial do saldo anterior (debito)",
         ):
             key = "opening_residual"
 
         elif kind in (
             "nota em aberto",
             "nota parcialmente baixada",
+            "nota parcialmente baixada (credito)",
+            "baixa parcial vinculada (debito)",
         ):
             key = "credit_residual"
 
         elif kind in (
             "debito residual",
             "pagamento parcialmente utilizado",
+            "pagamento parcialmente utilizado (debito)",
+            "provisao vinculada a baixa (credito)",
         ):
             key = "debit_residual"
 

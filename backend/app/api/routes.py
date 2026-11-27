@@ -1581,22 +1581,17 @@ def get_divergences(job_id: str):
 
 @router.get("/reconciliation/{job_id}/supplier-summary")
 def get_supplier_summary(job_id: str):
+    from app.engine.full_snapshot_v5 import supplier_summary_v5
     conn = get_connection()
-    rows = conn.execute("""
-    SELECT 
-        extracted_supplier as supplier,
-        SUM(CASE WHEN trans_type = 'CREDIT' THEN CAST(amount AS REAL) ELSE 0 END) as total_invoiced,
-        SUM(CASE WHEN trans_type = 'DEBIT' THEN CAST(amount AS REAL) ELSE 0 END) as total_paid,
-        SUM(CASE WHEN trans_type = 'CREDIT' THEN CAST(remaining_amount AS REAL) ELSE 0 END) as open_balance,
-        COUNT(CASE WHEN trans_type = 'CREDIT' THEN 1 END) as invoices_count
-    FROM transactions
-    WHERE job_id = ?
-    GROUP BY extracted_supplier
-    ORDER BY open_balance DESC, total_invoiced DESC
-    """, (job_id,)).fetchall()
-    items = [dict(r) for r in rows]
-    conn.close()
-    return items
+    try:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE job_id = ?",
+            (job_id,)
+        ).fetchall()
+        tx = [dict(r) for r in rows]
+        return supplier_summary_v5(tx)
+    finally:
+        conn.close()
 
 @router.post("/reconciliation/{job_id}/manual-match")
 def manual_match(job_id: str, payload: ManualMatchRequest):

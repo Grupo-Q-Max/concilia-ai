@@ -87,5 +87,50 @@ class TestAutoRepairAndMultiFile(unittest.TestCase):
         self.assertEqual(total, Decimal('-208.32'))
         self.assertTrue(res['valid'])
 
+        from app.engine.closing_v5 import closing_summary_v5
+        closing = closing_summary_v5(job, res)
+        self.assertTrue(closing['valid'])
+        self.assertEqual(closing['unknown_count'], 0)
+        self.assertEqual(Decimal(closing['credit_residual']), Decimal('-208.32'))
+        self.assertEqual(Decimal(closing['other_residual']), Decimal('0.00'))
+
+    def test_tax_retention_extraction_and_supplier_consolidation(self):
+        from app.engine.extractor import extract_transaction_info
+        from app.engine.full_snapshot_v5 import supplier_summary_v5
+
+        info = extract_transaction_info(
+            "VALOR A SER RECOLHIDO IRRF 28102 GONÇALVES BASSE E BENETTI ADVOGADOS ASSOCIADOS",
+            "CREDIT"
+        )
+        self.assertEqual(info["extracted_nf"], "28102")
+        self.assertEqual(
+            info["extracted_supplier"],
+            "GONÇALVES BASSE E BENETTI ADVOGADOS ASSOCIADOS"
+        )
+
+        tx = [
+            {
+                "trans_type": "CREDIT",
+                "amount": "1161.58",
+                "matched_amount": "1029.08",
+                "remaining_amount": "132.50",
+                "extracted_supplier": "A. G. M. PRESTADORA DE SERVICOS LTDA",
+                "cleaned_supplier": "",
+            },
+            {
+                "trans_type": "DEBIT",
+                "amount": "1029.08",
+                "matched_amount": "1029.08",
+                "remaining_amount": "0.00",
+                "extracted_supplier": "AGM PRESTADORA DE SERVICO",
+                "cleaned_supplier": "",
+            },
+        ]
+        summary = supplier_summary_v5(tx)
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["total_invoiced"], "1161.58")
+        self.assertEqual(summary[0]["total_paid"], "1029.08")
+        self.assertEqual(summary[0]["open_balance"], "132.50")
+
 if __name__ == "__main__":
     unittest.main()

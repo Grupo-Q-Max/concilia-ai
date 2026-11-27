@@ -73,7 +73,12 @@ if STATIC_DIR.exists():
                 detail="Caminho nao autorizado."
             )
         if file_path.is_file():
-            return FileResponse(file_path)
+            headers = (
+                {"Cache-Control": "no-cache, no-store, must-revalidate"}
+                if file_path.suffix.lower() == ".html"
+                else {}
+            )
+            return FileResponse(file_path, headers=headers)
         try:
             index_file = safe_static_path(
                 STATIC_DIR,
@@ -85,7 +90,10 @@ if STATIC_DIR.exists():
                 detail="Caminho nao autorizado."
             )
         if index_file.exists():
-            return FileResponse(index_file)
+            return FileResponse(
+                index_file,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+            )
         return {"error": "Frontend build not found"}
 else:
     @app.get("/")

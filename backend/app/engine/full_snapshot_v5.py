@@ -30,6 +30,8 @@ from app.engine.suggestion_financial_v5 import (
 
 
 def supplier_summary_v5(transactions):
+    from app.engine.reconciler import v5_supplier
+    from app.engine.extractor import clean_supplier_name
 
     zero = Decimal("0.00")
 
@@ -37,12 +39,14 @@ def supplier_summary_v5(transactions):
 
     for t in transactions:
 
-        supplier = t.get("extracted_supplier")
+        raw_supplier = str(t.get("extracted_supplier") or "").strip()
+        cleaned = t.get("cleaned_supplier") or clean_supplier_name(raw_supplier)
+        norm_key = v5_supplier(cleaned) or v5_supplier(raw_supplier) or raw_supplier.upper() or "NAO_IDENTIFICADO"
 
-        if supplier not in groups:
+        if norm_key not in groups:
 
-            groups[supplier] = {
-                "supplier": supplier,
+            groups[norm_key] = {
+                "supplier": raw_supplier or "FORNECEDOR NÃO IDENTIFICADO",
                 "total_invoiced": zero,
                 "total_paid": zero,
                 "open_balance": zero,
@@ -52,7 +56,16 @@ def supplier_summary_v5(transactions):
                 "supplier_debit_residual": zero,
             }
 
-        item = groups[supplier]
+        item = groups[norm_key]
+
+        # Prefer credit/uppercase supplier name as canonical display name
+        if raw_supplier and (
+            t["trans_type"] == "CREDIT"
+            or (raw_supplier.isupper() and not str(item["supplier"]).isupper())
+            or len(raw_supplier) > len(str(item["supplier"]))
+        ):
+            if t["trans_type"] == "CREDIT" or not str(item["supplier"]).isupper():
+                item["supplier"] = raw_supplier
 
         original = money(t["amount"])
         matched = money(t["matched_amount"])

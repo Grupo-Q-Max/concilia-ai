@@ -114,16 +114,20 @@ export const BalanceCompositionTable: React.FC<{job:any;summary:any;openItems:an
                     <div className="text-xs">
                         <p>Original: <strong>{fmt(r.original)}</strong></p>
                         <p>Baixado: <strong>{fmt(r.matched_amount)}</strong></p>
-                        <p>Residual: <strong>{fmt(r.value)}</strong></p>
+                        <p>Residual: <strong>{fmt(r.remaining_amount ?? r.value)}</strong></p>
                     </div>
 
                     {(c.payment_details || []).filter(
-                        (d:any) =>
-                            r.transaction_id &&
-                            (
-                                d.invoice_trans_id === r.transaction_id ||
-                                d.payment_trans_id === r.transaction_id
-                            )
+                        (d:any) => {
+                            if (!r.transaction_id) return false;
+                            const baseId = String(r.transaction_id)
+                                .replace(/_PARTIAL_(?:PAY|INV)$/, "")
+                                .replace(/^OPENING_MATCH:/, "OPENING:");
+                            return (
+                                d.invoice_trans_id === baseId ||
+                                d.payment_trans_id === baseId
+                            );
+                        }
                     ).map((d:any, index:number) => (
                         <div key={d.reconciliation_id || index}
                             className="rounded-lg border p-3 text-xs space-y-1">
@@ -144,12 +148,16 @@ export const BalanceCompositionTable: React.FC<{job:any;summary:any;openItems:an
                     ))}
 
                     {!(c.payment_details || []).some(
-                        (d:any) =>
-                            r.transaction_id &&
-                            (
-                                d.invoice_trans_id === r.transaction_id ||
-                                d.payment_trans_id === r.transaction_id
-                            )
+                        (d:any) => {
+                            if (!r.transaction_id) return false;
+                            const baseId = String(r.transaction_id)
+                                .replace(/_PARTIAL_(?:PAY|INV)$/, "")
+                                .replace(/^OPENING_MATCH:/, "OPENING:");
+                            return (
+                                d.invoice_trans_id === baseId ||
+                                d.payment_trans_id === baseId
+                            );
+                        }
                     ) && (
                         <p className="text-xs text-amber-700">
                             Baixa sem vinculo individual disponivel.

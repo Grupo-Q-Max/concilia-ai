@@ -257,32 +257,12 @@ export default function SmartSuggestions({
                 });
 
                 try {
-                    const latest = await getSmartSuggestions(jobId);
-
-                    const current = (latest.items || []).find(
-                        (s: Suggestion) => s.id === item.id
-                    );
-
-                    if (!current) {
-                        failed.push(`NF ${currentNf}: lancamento ja liquidado ou modificado.`);
-                        continue;
-                    }
-
-                    if (
-                        current.invoice_remaining !== item.invoice_remaining ||
-                        current.payment_remaining !== item.payment_remaining ||
-                        current.suggested_amount !== item.suggested_amount
-                    ) {
-                        failed.push(`NF ${currentNf}: saldo modificado por outra baixa.`);
-                        continue;
-                    }
-
                     const requiresIndividual = Boolean(
-                        current.ambiguous ||
-                        current.fiscal_equivalent ||
-                        current.requires_individual_review ||
-                        current.category !== "COMPATIVEL" ||
-                        !current.batch_eligible
+                        item.ambiguous ||
+                        item.fiscal_equivalent ||
+                        item.requires_individual_review ||
+                        item.category !== "COMPATIVEL" ||
+                        !item.batch_eligible
                     );
 
                     const approvalSource = (mode === "BATCH" || (!requiresIndividual && mode === "SELECTED"))
@@ -295,8 +275,8 @@ export default function SmartSuggestions({
                         item.payment_trans_id,
                         "Sugestao inteligente aprovada: " + item.reason,
                         {
-                            expected_invoice_remaining: String(current.invoice_remaining),
-                            expected_payment_remaining: String(current.payment_remaining),
+                            expected_invoice_remaining: String(item.invoice_remaining),
+                            expected_payment_remaining: String(item.payment_remaining),
                             approval_source: approvalSource,
                             confirm_review: true
                         }

@@ -27,6 +27,13 @@ def clean_supplier_name(raw_name: str) -> str:
         text
     )
     
+    # Collapse dotted initials (e.g. "A. G. M." -> "AGM")
+    text = re.sub(
+        r'\b([A-Z])\.\s*([A-Z])\.(?:\s*([A-Z])\.?)?',
+        lambda m: "".join(g for g in m.groups() if g),
+        text
+    )
+
     # Remove corporate designations and types
     patterns = [
         r'\bLTDA\b\.?',
@@ -37,14 +44,18 @@ def clean_supplier_name(raw_name: str) -> str:
         r'\bSOCIEDADE ANONIMA\b\.?',
         r'\bSOCIEDADE DE ADVOGADOS\b\.?',
         r'\bCOMERCIO DE\b\.?',
+        r'\bCOMERCIO\b\.?',
         r'\bCOMERCIAL\b\.?',
         r'\bINDUSTRIA E COMERCIO\b\.?',
+        r'\bINDUSTRIA\b\.?',
         r'\bIND\b\.?',
         r'\bCOM\b\.?',
-        r'\bSERVICOS\b\.?',
+        r'\bSERVICOS?\b\.?',
         r'\bSERV\b\.?',
         r'\bCONSULTORIA\b\.?',
         r'\bASSESSORIA\b\.?',
+        r'\bIMOBILIARIA\b\.?',
+        r'\bIMOB\b\.?',
         r'\bPARTICIPACOES\b\.?',
         r'\bMATERIAIS\b\.?',
         r'\bEQUIPAMENTOS\b\.?',
