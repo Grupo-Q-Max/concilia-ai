@@ -533,9 +533,85 @@ export async function deleteHistory(jobId?: string) {
   return response.json();
 }
 
+export interface OpeningPreviewV5 {
+  filename: string;
+  row_count: number;
+  column_count: number;
+  header_row: number;
+  columns: { index: number; letter: string; header: string }[];
+  mapping: Record<string, number>;
+  sample_rows: string[][];
+  job_initial_balance: string;
+}
+
+export interface OpeningValidationV5 {
+  valid: boolean;
+  count: number;
+  total_amount: string;
+  job_initial_balance: string;
+  difference: string;
+  sample: {
+    trans_date: string;
+    extracted_nf: string;
+    extracted_supplier: string;
+    history: string;
+    value: string;
+  }[];
+  header_row: number;
+  mapping: Record<string, number>;
+}
+
+export async function previewOpeningV5(
+  jobId: string,
+  file: File,
+  headerRow?: number,
+  signal?: AbortSignal
+): Promise<OpeningPreviewV5> {
+  const form = new FormData();
+  form.append("file", file);
+  if (typeof headerRow === "number") {
+    form.append("header_row", String(headerRow));
+  }
+  const res = await fetch(
+    `${API_BASE}/reconciliation/${encodeURIComponent(jobId)}/opening/preview`,
+    {
+      method: "POST",
+      body: form,
+      cache: "no-store",
+      signal
+    }
+  );
+  return readSafeResponseV5(res, "Pré-visualização do saldo anterior") as Promise<OpeningPreviewV5>;
+}
+
+export async function validateOpeningV5(
+  jobId: string,
+  file: File,
+  headerRow: number,
+  mapping: Record<string, number>,
+  signal?: AbortSignal
+): Promise<OpeningValidationV5> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("header_row", String(headerRow));
+  form.append("mapping_json", JSON.stringify(mapping));
+  const res = await fetch(
+    `${API_BASE}/reconciliation/${encodeURIComponent(jobId)}/opening/validate`,
+    {
+      method: "POST",
+      body: form,
+      cache: "no-store",
+      signal
+    }
+  );
+  return readSafeResponseV5(res, "Validação do saldo anterior") as Promise<OpeningValidationV5>;
+}
+
 export async function attachOpening(
   id: string,
-  file: File
+  file: File,
+  headerRow?: number,
+  mapping?: Record<string, number>
 ) {
   if (!file || file.size === 0) {
     throw new Error(
@@ -545,6 +621,12 @@ export async function attachOpening(
 
   const body = new FormData();
   body.append("file", file);
+  if (typeof headerRow === "number") {
+    body.append("header_row", String(headerRow));
+  }
+  if (mapping) {
+    body.append("column_mapping", JSON.stringify(mapping));
+  }
 
   const res = await fetch(
     `${API_BASE}/reconciliation/${encodeURIComponent(id)}/opening`,

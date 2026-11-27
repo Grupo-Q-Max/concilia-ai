@@ -2264,21 +2264,118 @@ def delete_history_job_v2(job_id: str):
     finally:
         conn.close()
 
-@router.post("/reconciliation/{job_id}/opening")
-async def attach_opening(job_id: str, file: UploadFile = File(...)):
+@router.post("/reconciliation/{job_id}/opening/preview")
+async def opening_preview(
+    job_id: str,
+    file: UploadFile = File(...),
+    header_row: Optional[int] = Form(None)
+):
     from app.operations_security_v5 import validate_uploaded_file_v5
-    validate_uploaded_file_v5(file, allowed={".xls", ".xlsx"})
+    validate_uploaded_file_v5(file, allowed={".xls", ".xlsx", ".csv"})
+    from app.engine.opening_import import inspect_opening_spreadsheet
+    import tempfile
+    from pathlib import Path
+
+    suffix = Path(file.filename or '').suffix.lower()
+    if suffix not in ('.xls', '.xlsx', '.csv'):
+        raise HTTPException(400, "Formato não suportado. Por favor, envie uma planilha em formato Excel (.xls, .xlsx) ou CSV.")
+
+    conn = get_connection()
+    try:
+        job = conn.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, f"Razão contábil base não encontrado no sistema (ID: {job_id}).")
+        job_init = str(job['initial_balance'] or '0.00')
+    finally:
+        conn.close()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ('opening' + suffix)
+            path.write_bytes(await file.read())
+            res = inspect_opening_spreadsheet(str(path), custom_header_row=header_row)
+            res['filename'] = file.filename
+            res['job_initial_balance'] = job_init
+            return res
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Erro ao pré-visualizar a planilha de saldo anterior: {str(exc)}")
+
+
+@router.post("/reconciliation/{job_id}/opening/validate")
+async def opening_validate(
+    job_id: str,
+    file: UploadFile = File(...),
+    header_row: int = Form(...),
+    mapping_json: str = Form(...)
+):
+    from app.operations_security_v5 import validate_uploaded_file_v5
+    validate_uploaded_file_v5(file, allowed={".xls", ".xlsx", ".csv"})
+    from app.engine.opening_import import validate_opening_spreadsheet
+    import tempfile
+    from pathlib import Path
+
+    suffix = Path(file.filename or '').suffix.lower()
+    if suffix not in ('.xls', '.xlsx', '.csv'):
+        raise HTTPException(400, "Formato não suportado. Por favor, envie uma planilha em formato Excel (.xls, .xlsx) ou CSV.")
+
+    try:
+        mapping = json.loads(mapping_json)
+        if not isinstance(mapping, dict):
+            raise ValueError("Mapeamento inválido.")
+    except Exception:
+        raise HTTPException(400, "JSON de mapeamento inválido.")
+
+    conn = get_connection()
+    try:
+        job = conn.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, f"Razão contábil base não encontrado no sistema (ID: {job_id}).")
+        job_init = str(job['initial_balance'] or '0.00')
+    finally:
+        conn.close()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ('opening' + suffix)
+            path.write_bytes(await file.read())
+            res = validate_opening_spreadsheet(str(path), header_row=header_row, column_mapping=mapping, job_initial_balance=job_init)
+            return res
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Erro ao validar a planilha de saldo anterior: {str(exc)}")
+
+
+@router.post("/reconciliation/{job_id}/opening")
+async def attach_opening(
+    job_id: str,
+    file: UploadFile = File(...),
+    header_row: Optional[int] = Form(None),
+    column_mapping: Optional[str] = Form(None)
+):
+    from app.operations_security_v5 import validate_uploaded_file_v5
+    validate_uploaded_file_v5(file, allowed={".xls", ".xlsx", ".csv"})
     from app.engine.opening_import import read_opening
     from pathlib import Path
     import tempfile
     suffix = Path(file.filename or '').suffix.lower()
-    if suffix not in ('.xls','.xlsx'):
-        raise HTTPException(400, "Formato não suportado. Por favor, envie uma planilha em formato Excel (.xls ou .xlsx).")
+    if suffix not in ('.xls', '.xlsx', '.csv'):
+        raise HTTPException(400, "Formato não suportado. Por favor, envie uma planilha em formato Excel (.xls ou .xlsx) ou CSV.")
+
+    mapping_dict = None
+    if column_mapping:
+        try:
+            mapping_dict = json.loads(column_mapping)
+        except Exception:
+            pass
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/('opening'+suffix)
             path.write_bytes(await file.read())
-            rows = read_opening(str(path), None)
+            rows = read_opening(str(path), None, column_mapping=mapping_dict, header_row=header_row)
             if not rows:
                 raise HTTPException(
                     400,

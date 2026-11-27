@@ -3,6 +3,7 @@
 
 // CONCILIA_V5_EXPORT_BUTTON_24D
 import ExportSuggestionsButton from "@/components/ExportSuggestionsButton";
+import { OpeningUploadModal } from "@/components/OpeningUploadModal";
 
 
 import React, {
@@ -79,6 +80,8 @@ export default function OpeningReconciliation({
 
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadError, setUploadError] = useState("");
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(null);
 
   const lock = useRef(false);
   const request = useRef(0);
@@ -203,22 +206,13 @@ export default function OpeningReconciliation({
 
   };
 
-  const handleFileUpload = async (file: File) => {
+  const handleFileUpload = (file: File) => {
     if (!file) return;
-    setUploadBusy(true);
     setUploadError("");
     setError("");
     setMessage("");
-    try {
-      await attachOpening(jobId, file);
-      await onRefresh();
-      await load();
-      setMessage("Planilha de Saldo Anterior importada e cruzada com sucesso!");
-    } catch (e: unknown) {
-      setUploadError(errorText(e));
-    } finally {
-      setUploadBusy(false);
-    }
+    setSelectedUploadFile(file);
+    setIsUploadModalOpen(true);
   };
 
   const eligibleItems = (data?.items || []).filter(
@@ -346,21 +340,18 @@ export default function OpeningReconciliation({
 
         <div className="flex items-center gap-2">
           {data?.opening_attached && (
-            <label className="inline-flex items-center gap-1.5 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 px-3 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-colors shadow-2xs">
+            <button
+              type="button"
+              disabled={busy || loading}
+              onClick={() => {
+                setSelectedUploadFile(null);
+                setIsUploadModalOpen(true);
+              }}
+              className="inline-flex items-center gap-1.5 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 px-3 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-colors shadow-2xs"
+            >
               <UploadCloud className="w-3.5 h-3.5 text-blue-600" />
-              <span>{uploadBusy ? "Enviando..." : "Trocar/Reenviar Planilha"}</span>
-              <input
-                type="file"
-                accept=".xls,.xlsx,.csv"
-                className="hidden"
-                disabled={uploadBusy}
-                onChange={e => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleFileUpload(f);
-                  e.target.value = "";
-                }}
-              />
-            </label>
+              <span>Trocar / Reenviar Planilha</span>
+            </button>
           )}
 
           <ExportSuggestionsButton
@@ -427,21 +418,18 @@ export default function OpeningReconciliation({
             </p>
           </div>
           <div className="pt-2">
-            <label className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 py-2.5 rounded-xl cursor-pointer shadow-sm transition-colors">
+            <button
+              type="button"
+              disabled={busy || loading}
+              onClick={() => {
+                setSelectedUploadFile(null);
+                setIsUploadModalOpen(true);
+              }}
+              className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 py-2.5 rounded-xl cursor-pointer shadow-sm transition-colors"
+            >
               <UploadCloud className="w-4 h-4" />
               <span>Selecionar Planilha de Saldo Anterior</span>
-              <input
-                type="file"
-                accept=".xls,.xlsx,.csv"
-                className="hidden"
-                disabled={uploadBusy}
-                onChange={e => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleFileUpload(f);
-                  e.target.value = "";
-                }}
-              />
-            </label>
+            </button>
           </div>
           {uploadBusy && (
             <div className="flex items-center justify-center gap-2 text-xs font-semibold text-blue-700 pt-2">
@@ -728,7 +716,22 @@ export default function OpeningReconciliation({
 
       )}
 
+      <OpeningUploadModal
+        isOpen={isUploadModalOpen}
+        onClose={() => {
+          setIsUploadModalOpen(false);
+          setSelectedUploadFile(null);
+        }}
+        jobId={jobId}
+        initialBalance={initialBalance}
+        initialFile={selectedUploadFile}
+        onSuccess={async () => {
+          await onRefresh();
+          await load();
+          setMessage("Planilha de Saldo Anterior importada e mapeada com sucesso!");
+        }}
+      />
+
     </section>
   );
-
 }

@@ -7,10 +7,69 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.engine.opening_import import read_opening, infer_headerless_mapping, detect_column_mapping, norm
+from app.engine.opening_import import (
+    read_opening, infer_headerless_mapping, detect_column_mapping, norm,
+    inspect_opening_spreadsheet, validate_opening_spreadsheet
+)
 
 
 class TestOpeningImport(unittest.TestCase):
+
+    def test_inspect_and_validate_opening(self):
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            temp_path = f.name
+
+        try:
+            df = pd.DataFrame([
+                ["2024-12-31", "entrada conforme NOTA FISCAL 1", 1.0],
+                ["2024-12-31", "NOTA FISCAL 2", 2.0],
+                ["2024-12-31", "NOTA FISCAL 5", 51200.0],
+            ])
+            df.to_excel(temp_path, index=False, header=False)
+
+            preview = inspect_opening_spreadsheet(temp_path)
+            self.assertEqual(preview["row_count"], 3)
+            self.assertEqual(preview["column_count"], 3)
+            self.assertEqual(len(preview["columns"]), 3)
+            self.assertEqual(preview["mapping"]["date"], 0)
+            self.assertEqual(preview["mapping"]["value"], 2)
+
+            val = validate_opening_spreadsheet(
+                temp_path,
+                header_row=0,
+                column_mapping=preview["mapping"],
+                job_initial_balance="51203.00"
+            )
+            self.assertTrue(val["valid"])
+            self.assertEqual(val["count"], 3)
+            self.assertEqual(val["total_amount"], "51203.00")
+            self.assertEqual(val["difference"], "0.00")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_explicit_column_mapping_read(self):
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            temp_path = f.name
+
+        try:
+            # File with col 0 = Amount, col 1 = Description, col 2 = Date
+            df = pd.DataFrame([
+                [500.0, "NF 999", "2024-12-31"],
+                [150.0, "NF 888", "2024-12-31"],
+            ])
+            df.to_excel(temp_path, index=False, header=False)
+
+            custom_map = {"value": 0, "history": 1, "date": 2}
+            rows = read_opening(temp_path, column_mapping=custom_map, header_row=0)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["extracted_nf"], "999")
+            self.assertEqual(rows[0]["value"], "-500.00")
+            self.assertEqual(rows[1]["extracted_nf"], "888")
+            self.assertEqual(rows[1]["value"], "-150.00")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def test_headerless_3_columns_excel(self):
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:

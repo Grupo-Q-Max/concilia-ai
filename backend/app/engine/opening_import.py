@@ -168,7 +168,7 @@ def infer_headerless_mapping(df):
     return None
 
 
-def read_opening(path, initial=None):
+def read_opening(path, initial=None, column_mapping=None, header_row=None):
     dfs = []
     try:
         with warnings.catch_warnings():
@@ -194,19 +194,28 @@ def read_opening(path, initial=None):
 
     for sheet_name, df in dfs:
         rows = []
-        current_map = infer_headerless_mapping(df)
+        if column_mapping:
+            current_map = {'type': 'table'}
+            for k, v in column_mapping.items():
+                if v is not None and str(v).strip() != '' and str(v).isdigit():
+                    current_map[k] = int(v)
+            start_row = header_row if (header_row is not None and header_row > 0) else 0
+        else:
+            current_map = infer_headerless_mapping(df)
+            start_row = 0
 
-        for r_idx in range(len(df)):
+        for r_idx in range(start_row, len(df)):
             row = df.iloc[r_idx]
             cells = [str(c).strip() if pd.notna(c) else '' for c in row]
             if not any(cells):
                 continue
             norm_cells = [norm(c) for c in cells]
 
-            detected = detect_column_mapping(norm_cells)
-            if detected:
-                current_map = detected
-                continue
+            if not column_mapping:
+                detected = detect_column_mapping(norm_cells)
+                if detected:
+                    current_map = detected
+                    continue
 
             if not current_map:
                 continue
@@ -334,3 +343,83 @@ def read_opening(path, initial=None):
         raise ValueError('Nenhum lancamento valido encontrado na planilha complementar.')
 
     return best_rows
+
+
+def inspect_opening_spreadsheet(path, custom_header_row=None):
+    base_df = universal_read_spreadsheet(path).dropna(how='all').dropna(axis=1, how='all')
+    if base_df.empty:
+        raise ValueError('Planilha vazia.')
+
+    num_rows, num_cols = base_df.shape
+
+    # Determine header row (1-based index, or 0 for headerless)
+    header_row_idx = -1
+    if custom_header_row is not None:
+        header_row_idx = custom_header_row - 1 if custom_header_row > 0 else -1
+    else:
+        for idx in range(min(5, num_rows)):
+            row_cells = [norm(base_df.iloc[idx, c]) for c in range(num_cols)]
+            if detect_column_mapping(row_cells):
+                header_row_idx = idx
+                break
+
+    from openpyxl.utils import get_column_letter
+    columns = []
+    for c in range(num_cols):
+        hdr = ''
+        if header_row_idx >= 0 and header_row_idx < num_rows:
+            val = base_df.iloc[header_row_idx, c]
+            hdr = str(val).strip() if pd.notna(val) else ''
+        letter = get_column_letter(c + 1)
+        columns.append({
+            'index': c,
+            'letter': letter,
+            'header': hdr
+        })
+
+    if header_row_idx >= 0:
+        row_cells = [norm(base_df.iloc[header_row_idx, c]) for c in range(num_cols)]
+        detected = detect_column_mapping(row_cells) or {}
+    else:
+        detected = infer_headerless_mapping(base_df) or {}
+
+    mapping = {}
+    for key in ('date', 'value', 'history', 'doc', 'nf', 'supplier', 'debit', 'credit', 'nature', 'amount'):
+        if key in detected and detected[key] is not None:
+            mapping[key] = detected[key]
+
+    start_data = header_row_idx + 1 if header_row_idx >= 0 else 0
+    sample_rows = []
+    for r in range(start_data, min(start_data + 6, num_rows)):
+        row_vals = [str(base_df.iloc[r, c]).strip() if pd.notna(base_df.iloc[r, c]) else '' for c in range(num_cols)]
+        sample_rows.append(row_vals)
+
+    return {
+        'row_count': num_rows,
+        'column_count': num_cols,
+        'header_row': header_row_idx + 1 if header_row_idx >= 0 else 0,
+        'columns': columns,
+        'mapping': mapping,
+        'sample_rows': sample_rows
+    }
+
+
+def validate_opening_spreadsheet(path, header_row, column_mapping, job_initial_balance='0.00'):
+    rows = read_opening(path, column_mapping=column_mapping, header_row=header_row)
+    if not rows:
+        raise ValueError('Nenhum lançamento válido encontrado com o mapeamento informado.')
+
+    total_amount = sum(abs(Decimal(r['value'])) for r in rows)
+    initial_dec = abs(Decimal(str(job_initial_balance or 0)))
+    difference = abs(initial_dec - total_amount)
+
+    return {
+        'valid': True,
+        'count': len(rows),
+        'total_amount': str(total_amount.quantize(Decimal('0.01'))),
+        'job_initial_balance': str(initial_dec.quantize(Decimal('0.01'))),
+        'difference': str(difference.quantize(Decimal('0.01'))),
+        'sample': rows[:10],
+        'header_row': header_row,
+        'mapping': column_mapping
+    }
