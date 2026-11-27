@@ -987,7 +987,7 @@ async def upload_and_process_ledger(
     upload_list: List[UploadFile] = []
     if files:
         upload_list.extend([f for f in files if f and f.filename])
-    if file and file.filename and file not in upload_list:
+    if not upload_list and file and file.filename:
         upload_list.append(file)
 
     if not upload_list:
@@ -995,6 +995,18 @@ async def upload_and_process_ledger(
 
     for f in upload_list:
         validate_uploaded_file_v5(f)
+
+    if len(upload_list) > 1:
+        unique_uploads: List[UploadFile] = []
+        seen_hashes = set()
+        for f in upload_list:
+            f.file.seek(0)
+            file_digest = hashlib.sha256(f.file.read()).hexdigest()
+            f.file.seek(0)
+            if file_digest not in seen_hashes:
+                seen_hashes.add(file_digest)
+                unique_uploads.append(f)
+        upload_list = unique_uploads
 
     job_id = str(uuid.uuid4())
     mapped = any(

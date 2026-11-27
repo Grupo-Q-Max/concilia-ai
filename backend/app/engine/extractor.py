@@ -17,7 +17,12 @@ def clean_supplier_name(raw_name: str) -> str:
     
     # Remove common transaction & supplier prefixes
     text = re.sub(
-        r'^(?:PAGAMENTO|PAGTO|PGTO|PAGO|ENTRADA|PROVISAO|VALOR\s+A\s+SER\s+RECOLHIDO|AQUISICAO|CONFORME|VR|VLR|CRF|FORNECEDOR|FAVORECIDO|CLIENTE)[:\s\-]+',
+        r'^(?:PAGAMENTO|PAGTO|PGTO|PAGO|ENTRADA|PROVISAO|VALOR\s+A\s+SER\s+RECOLHIDO|AQUISICAO|CONFORME|VR|VLR|CRF|CSRF|IRRF|IR|ISS|ISSQN|INSS|PIS|COFINS|CSLL|PCC|FORNECEDOR|FAVORECIDO|CLIENTE)[:\s\-\d,%]+',
+        '',
+        text
+    )
+    text = re.sub(
+        r'^(?:CRF|CSRF|IRRF|IR|ISS|ISSQN|INSS|PIS|COFINS|CSLL|PCC)\b[:\s\-\d,%]*',
         '',
         text
     )
@@ -158,6 +163,27 @@ def extract_transaction_info(history: str, trans_type: str) -> Dict[str, Any]:
             else:
                 supplier = clean_hist
         category = "PROVISAO_NOTA_FISCAL"
+
+    # Check if Valor a ser recolhido (Tax / Retention Provision - IRRF, CRF, CSRF, ISS, INSS, etc.)
+    elif "VALOR A SER RECOLHIDO" in hist_upper:
+        clean_hist = re.sub(
+            r'(?i)^VALOR\s+A\s+SER\s+RECOLHIDO\s*(?:(?:IRRF|CRF|CSRF|ISSQN|ISS|INSS|PIS|COFINS|CSLL|PCC|IR)\b[:\s\-]*)?',
+            '',
+            hist
+        ).strip()
+        # Case A: <NF> <SUPPLIER> (e.g. "28102 GONÇALVES BASSE E BENETTI ADVOGADOS ASSOCIADOS")
+        m_lead_nf = re.match(r'^(?:(?:NF|NOTA\s+FISCAL|DOC)[:\.\s]*)?(\d{1,10})\s+(.+)$', clean_hist, flags=re.I)
+        # Case B: <SUPPLIER> <NF> (e.g. "Servilimp Conservacao e Limpeza Eireli 186")
+        m_tail_nf = re.match(r'^(.+?)\s+(?:(?:NF|NOTA\s+FISCAL|DOC)[:\.\s]*)?(\d{1,10})\s*$', clean_hist, flags=re.I)
+        if m_lead_nf:
+            nf = m_lead_nf.group(1).strip()
+            supplier = m_lead_nf.group(2).strip()
+        elif m_tail_nf:
+            supplier = m_tail_nf.group(1).strip()
+            nf = m_tail_nf.group(2).strip()
+        else:
+            supplier = clean_hist
+        category = "PROVISAO_IMPOSTO_RETIDO"
 
     # Check if Pagamento (Payment / Debit)
     elif "PAGAMENTO" in hist_upper or "PAGTO" in hist_upper:

@@ -52,7 +52,7 @@ def v5_supplier(value):
     text = re.sub(
         r"\b(?:AQUISICAO|CONFORME|NOTA|FISCAL|"
         r"PAGAMENTO|PAGTO|PGTO|PAGO|VSP|OUTROS|"
-        r"ENTRADA|PROVISAO|VALOR|RECOLHIDO|CRF|"
+        r"ENTRADA|PROVISAO|VALOR|RECOLHIDO|CRF|CSRF|IRRF|ISS|ISSQN|INSS|PIS|COFINS|CSLL|PCC|"
         r"CONTRATO|GERENCIAMENTO|ITENS|REF)\b",
         " ",
         text
@@ -130,16 +130,16 @@ def v5_fiscal_equivalent(a, b):
     if not x.isdigit() or not y.isdigit():
         return False
 
-    if not v5_supplier_match(a, b):
-        return False
-
     year_a = str(a.get("trans_date") or "")[:4]
     year_b = str(b.get("trans_date") or "")[:4]
 
-    return bool(
+    if not (
         v5_extended_alias(x, year_a) == y
         or v5_extended_alias(y, year_b) == x
-    )
+    ):
+        return False
+
+    return v5_supplier_match(a, b)
 
 
 def v5_exact_pass(job_id, transactions, reconciliations):
@@ -160,14 +160,15 @@ def v5_exact_pass(job_id, transactions, reconciliations):
             and not t.get("is_duplicate")
         ]
 
+        debits_by_amount = {}
+        for d in debits:
+            debits_by_amount.setdefault(d["remaining_amount"], []).append(d)
+
         candidates = {}
         reverse = {}
 
         for c in credits:
-            for d in debits:
-                if c["remaining_amount"] != d["remaining_amount"]:
-                    continue
-
+            for d in debits_by_amount.get(c["remaining_amount"], ()):
                 a = v5_reference(c)
                 b = v5_reference(d)
 
@@ -317,14 +318,15 @@ def v5_partition_ambiguous(transactions):
         and t["remaining_amount"] > 0
     ]
 
+    fiscal_debits_by_amt = {}
+    for d in fiscal_debits:
+        fiscal_debits_by_amt.setdefault(d["remaining_amount"], []).append(d)
+
     fiscal_forward = {}
     fiscal_reverse = {}
 
     for c in fiscal_credits:
-        for d in fiscal_debits:
-            if c["remaining_amount"] != d["remaining_amount"]:
-                continue
-
+        for d in fiscal_debits_by_amt.get(c["remaining_amount"], ()):
             a = v5_reference(c)
             b = v5_reference(d)
 
@@ -534,14 +536,45 @@ def v5_reserve_duplicates(transactions):
         if t["id"] in reserved
     ]
 
+    # Index counterparts by NF, fiscal alias, and amount to avoid O(N^2) scan
+    by_nf = {}
+    by_amount_no_nf = {}
+    for other in transactions:
+        nf2 = v5_reference(other)
+        if nf2:
+            by_nf.setdefault(nf2, []).append(other)
+            year2 = str(other.get("trans_date") or "")[:4]
+            alias2 = v5_extended_alias(nf2, year2)
+            if alias2:
+                by_nf.setdefault(alias2, []).append(other)
+        else:
+            by_amount_no_nf.setdefault(other["amount"], []).append(other)
+
     for duplicate in duplicate_rows:
+        nf1 = v5_reference(duplicate)
+        year1 = str(duplicate.get("trans_date") or "")[:4]
+        alias1 = v5_extended_alias(nf1, year1) if nf1 else None
 
-        for other in transactions:
+        candidate_others = []
+        if nf1:
+            candidate_others.extend(by_nf.get(nf1, ()))
+        if alias1:
+            candidate_others.extend(by_nf.get(alias1, ()))
+        if not nf1:
+            candidate_others.extend(by_amount_no_nf.get(duplicate["amount"], ()))
+            for other in transactions:
+                if other["amount"] == duplicate["amount"]:
+                    candidate_others.append(other)
+        else:
+            candidate_others.extend(by_amount_no_nf.get(duplicate["amount"], ()))
 
+        for other in candidate_others:
             if duplicate["trans_type"] == other["trans_type"]:
                 continue
 
-            nf1 = v5_reference(duplicate)
+            if other["id"] in reserved:
+                continue
+
             nf2 = v5_reference(other)
 
             same_nf = bool(

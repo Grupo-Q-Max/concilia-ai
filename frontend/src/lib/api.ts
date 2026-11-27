@@ -338,8 +338,10 @@ export const api = {
     const form = new FormData();
 
     form.append("file", primaryFile);
-    for (const f of fileList) {
-      form.append("files", f);
+    if (fileList.length > 1) {
+      for (const f of fileList) {
+        form.append("files", f);
+      }
     }
 
     form.append(
