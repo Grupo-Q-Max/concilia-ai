@@ -112,29 +112,70 @@ def composition(job, transactions, opening=None):
 
         if residual:
 
-            if sign == 1:
-
-                kind = (
-                    "Pagamento parcialmente utilizado"
-                    if matched > 0
-                    else "D\u00e9bito residual"
-                )
-
+            if matched > 0:
+                # CONCILIA_V5_ANALYTIC_PARTIAL: Consta tanto o debito quanto o credito parcial
+                orig_amt = money(t["amount"])
+                if sign == -1:
+                    # Provisao / Nota fiscal (Credito) parcialmente baixada
+                    add(
+                        "Nota parcialmente baixada (Crédito)",
+                        -orig_amt,
+                        t,
+                        residual=residual,
+                        matched=matched
+                    )
+                    # Baixa parcial vinculada (Debito)
+                    add(
+                        "Baixa parcial vinculada (Débito)",
+                        matched,
+                        {
+                            "id": (t.get("id") or "") + "_PARTIAL_PAY",
+                            "trans_date": t.get("trans_date", ""),
+                            "extracted_nf": t.get("extracted_nf", ""),
+                            "extracted_supplier": t.get("extracted_supplier", ""),
+                            "history": f"Baixa parcial ref. NF {t.get('extracted_nf') or ''}: {t.get('history') or ''}",
+                            "amount": str(matched)
+                        },
+                        residual=Decimal("0.00"),
+                        matched=matched
+                    )
+                else:
+                    # Pagamento (Debito) parcialmente utilizado
+                    add(
+                        "Pagamento parcialmente utilizado (Débito)",
+                        orig_amt,
+                        t,
+                        residual=residual,
+                        matched=matched
+                    )
+                    # Provisao vinculada (Credito)
+                    add(
+                        "Provisão vinculada à baixa (Crédito)",
+                        -matched,
+                        {
+                            "id": (t.get("id") or "") + "_PARTIAL_INV",
+                            "trans_date": t.get("trans_date", ""),
+                            "extracted_nf": t.get("extracted_nf", ""),
+                            "extracted_supplier": t.get("extracted_supplier", ""),
+                            "history": f"Provisão abatida ref. NF {t.get('extracted_nf') or ''}: {t.get('history') or ''}",
+                            "amount": str(matched)
+                        },
+                        residual=Decimal("0.00"),
+                        matched=matched
+                    )
             else:
-
                 kind = (
-                    "Nota parcialmente baixada"
-                    if matched > 0
+                    "D\u00e9bito residual"
+                    if sign == 1
                     else "Nota em aberto"
                 )
-
-            add(
-                kind,
-                sign * residual,
-                t,
-                residual=residual,
-                matched=matched
-            )
+                add(
+                    kind,
+                    sign * residual,
+                    t,
+                    residual=residual,
+                    matched=matched
+                )
 
         if t["status"] == "DIVERGENCIA_CENTAVOS":
 

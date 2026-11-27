@@ -426,6 +426,8 @@ export default function Home() {
                 key={activeJobId}
                 jobId={activeJobId}
                 onRefresh={refreshActiveJob}
+                initialBalance={jobSummary?.job?.initial_balance}
+                composition={jobSummary?.summary?.composition_v3}
             />
         )}
         <details className="rounded-2xl border border-slate-200 bg-white p-5">

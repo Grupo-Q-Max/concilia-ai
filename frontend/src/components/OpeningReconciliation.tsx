@@ -15,12 +15,21 @@ import React, {
 import {
   getOpeningSuggestionsV5,
   approveOpeningV5,
+  attachOpening,
   api,
   OpeningDataV5,
   OpeningSuggestionV5,
   Transaction
 } from "@/lib/api";
 import { displayNf } from "@/components/SmartSuggestions";
+import {
+  UploadCloud,
+  FileSpreadsheet,
+  CheckCheck,
+  Loader2,
+  AlertCircle,
+  CheckCircle2
+} from "lucide-react";
 
 type Props = {
   revision: number;
@@ -60,6 +69,16 @@ export default function OpeningReconciliation({
   const [filter, setFilter] = useState("ALL");
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState(30);
+
+  const [batchProgress, setBatchProgress] = useState<{
+    total: number;
+    current: number;
+    currentNf: string;
+    currentAmount: string;
+  } | null>(null);
+
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadError, setUploadError] = useState("");
 
   const lock = useRef(false);
   const request = useRef(0);
@@ -184,6 +203,87 @@ export default function OpeningReconciliation({
 
   };
 
+  const handleFileUpload = async (file: File) => {
+    if (!file) return;
+    setUploadBusy(true);
+    setUploadError("");
+    setError("");
+    setMessage("");
+    try {
+      await attachOpening(jobId, file);
+      await onRefresh();
+      await load();
+      setMessage("Planilha de Saldo Anterior importada e cruzada com sucesso!");
+    } catch (e: unknown) {
+      setUploadError(errorText(e));
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const eligibleItems = (data?.items || []).filter(
+    item => item.automatic_eligible && !item.ambiguous && !item.current_conflict
+  );
+
+  const handleBatchApprove = async () => {
+    if (lock.current || busy || loading || eligibleItems.length === 0) return;
+
+    if (!window.confirm(
+      `Deseja aprovar automaticamente ${eligibleItems.length} baixas compatíveis do saldo anterior?\n` +
+      `O saldo contábil e as composições serão preservados.`
+    )) return;
+
+    lock.current = true;
+    setBusy(true);
+    setError("");
+    setMessage("");
+
+    let completed = 0;
+    const failed: string[] = [];
+
+    try {
+      for (let i = 0; i < eligibleItems.length; i++) {
+        const item = eligibleItems[i];
+        const nf = displayNf(item.opening_nf, rows[item.opening_index]?.history);
+        const amount = fmt(Math.min(Number(item.opening_amount), Number(item.payment_amount)));
+
+        setBatchProgress({
+          total: eligibleItems.length,
+          current: i + 1,
+          currentNf: nf,
+          currentAmount: amount
+        });
+
+        try {
+          const res = await approveOpeningV5(jobId, item);
+          if (res.success) {
+            completed++;
+          } else {
+            failed.push(`NF ${nf}: ${res.detail || "Falha ao registrar baixa."}`);
+          }
+        } catch (e: unknown) {
+          failed.push(`NF ${nf}: ${errorText(e)}`);
+        }
+      }
+
+      setMessage(
+        `Sucesso: ${completed} baixas do saldo anterior aprovadas e registradas com sucesso!` +
+        (failed.length > 0 ? ` (${failed.length} pendentes de conferência manual).` : "")
+      );
+
+      try {
+        await onRefresh();
+      } catch (e) {
+        // ignore refresh error
+      }
+    } finally {
+      setBatchProgress(null);
+      await load();
+      lock.current = false;
+      setBusy(false);
+    }
+  };
+
   const rows = data?.opening_rows || [];
 
   const creditorResidual = rows.reduce(
@@ -244,13 +344,33 @@ export default function OpeningReconciliation({
           </p>
         </div>
 
-        <ExportSuggestionsButton
-          key={jobId}
-          jobId={jobId}
-          tab="opening-suggestions"
-          label="Exportar saldo anterior em Excel"
-          disabled={busy || loading}
-        />
+        <div className="flex items-center gap-2">
+          {data?.opening_attached && (
+            <label className="inline-flex items-center gap-1.5 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 px-3 py-2 rounded-xl text-xs font-semibold cursor-pointer transition-colors shadow-2xs">
+              <UploadCloud className="w-3.5 h-3.5 text-blue-600" />
+              <span>{uploadBusy ? "Enviando..." : "Trocar/Reenviar Planilha"}</span>
+              <input
+                type="file"
+                accept=".xls,.xlsx,.csv"
+                className="hidden"
+                disabled={uploadBusy}
+                onChange={e => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleFileUpload(f);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          )}
+
+          <ExportSuggestionsButton
+            key={jobId}
+            jobId={jobId}
+            tab="opening-suggestions"
+            label="Exportar saldo anterior em Excel"
+            disabled={busy || loading}
+          />
+        </div>
 
       </div>
 
@@ -294,10 +414,47 @@ export default function OpeningReconciliation({
       {loading && <p>Carregando saldo anterior...</p>}
 
       {!loading && data && !data.opening_attached && (
-        <p className="text-sm">
-          Anexe a planilha complementar acima para consultar
-          as notas do saldo anterior.
-        </p>
+        <div className="border-2 border-dashed border-blue-200 bg-blue-50/40 rounded-2xl p-8 text-center space-y-3">
+          <div className="w-12 h-12 rounded-xl bg-blue-100 text-blue-700 mx-auto flex items-center justify-center">
+            <FileSpreadsheet className="w-6 h-6" />
+          </div>
+          <div>
+            <h4 className="font-bold text-slate-800 text-base">
+              Anexar Planilha de Saldo Anterior do Fornecedor
+            </h4>
+            <p className="text-xs text-slate-500 max-w-lg mx-auto mt-1">
+              Envie a planilha de títulos anteriores (.xls, .xlsx, .csv). O sistema fará o cruzamento inteligente com os pagamentos do razão atual e listará as baixas para aprovação.
+            </p>
+          </div>
+          <div className="pt-2">
+            <label className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 py-2.5 rounded-xl cursor-pointer shadow-sm transition-colors">
+              <UploadCloud className="w-4 h-4" />
+              <span>Selecionar Planilha de Saldo Anterior</span>
+              <input
+                type="file"
+                accept=".xls,.xlsx,.csv"
+                className="hidden"
+                disabled={uploadBusy}
+                onChange={e => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleFileUpload(f);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          {uploadBusy && (
+            <div className="flex items-center justify-center gap-2 text-xs font-semibold text-blue-700 pt-2">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span>Lendo, sanitizando e cruzando lançamentos anteriores...</span>
+            </div>
+          )}
+          {uploadError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl max-w-md mx-auto text-left">
+              <strong>⚠️ Erro:</strong> {uploadError}
+            </div>
+          )}
+        </div>
       )}
 
       {data?.opening_attached && (
@@ -361,38 +518,73 @@ export default function OpeningReconciliation({
 
           </details>
 
-          <div className="flex flex-wrap gap-3 items-center">
+          <div className="flex flex-wrap gap-3 items-center justify-between">
 
-            <h4 className="font-bold">
-              Sugestoes ({data.total})
-            </h4>
+            <div className="flex flex-wrap gap-3 items-center">
+              <h4 className="font-bold">
+                Sugestoes ({data.total})
+              </h4>
 
-            <input
-              value={search}
-              placeholder="Buscar NF ou fornecedor"
-              onChange={e => {
-                setSearch(e.target.value);
-                setLimit(30);
-              }}
-              className="border rounded-lg px-3 py-2 text-sm"
-            />
+              <input
+                value={search}
+                placeholder="Buscar NF ou fornecedor"
+                onChange={e => {
+                  setSearch(e.target.value);
+                  setLimit(30);
+                }}
+                className="border rounded-lg px-3 py-2 text-sm"
+              />
 
-            <select
-              value={filter}
-              onChange={e => {
-                setFilter(e.target.value);
-                setLimit(30);
-              }}
-              className="border rounded-lg px-3 py-2 text-sm"
-            >
-              <option value="ALL">Todas</option>
-              <option value="EXATO">Exatas</option>
-              <option value="PARCIAL">Parciais</option>
-              <option value="DIVERGENCIA_NF">NFs diferentes</option>
-              <option value="AMBIGUOUS">Ambiguas</option>
-            </select>
+              <select
+                value={filter}
+                onChange={e => {
+                  setFilter(e.target.value);
+                  setLimit(30);
+                }}
+                className="border rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="ALL">Todas</option>
+                <option value="EXATO">Exatas</option>
+                <option value="PARCIAL">Parciais</option>
+                <option value="DIVERGENCIA_NF">NFs diferentes</option>
+                <option value="AMBIGUOUS">Ambiguas</option>
+              </select>
+            </div>
+
+            {eligibleItems.length > 0 && (
+              <button
+                type="button"
+                disabled={busy || loading}
+                onClick={handleBatchApprove}
+                className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-bold shadow-xs transition-colors disabled:opacity-50"
+              >
+                <CheckCheck className="w-4 h-4" />
+                <span>Aprovar em lote ({eligibleItems.length} compatíveis)</span>
+              </button>
+            )}
 
           </div>
+
+          {batchProgress && (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-emerald-800">
+                <span className="flex items-center gap-1.5">
+                  <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                  Aprovando baixas do saldo anterior em lote... ({batchProgress.current} de {batchProgress.total})
+                </span>
+                <span>{Math.round((batchProgress.current / batchProgress.total) * 100)}%</span>
+              </div>
+              <div className="w-full bg-emerald-200/60 rounded-full h-2 overflow-hidden">
+                <div
+                  className="bg-emerald-600 h-2 rounded-full transition-all duration-150"
+                  style={{ width: `${Math.round((batchProgress.current / batchProgress.total) * 100)}%` }}
+                />
+              </div>
+              <p className="text-xs text-emerald-700">
+                Processando NF <strong>{batchProgress.currentNf}</strong> · Valor: <strong>{batchProgress.currentAmount}</strong>
+              </p>
+            </div>
+          )}
 
           {!filtered.length && !loading && (
             <p className="text-sm text-slate-500">

@@ -140,26 +140,57 @@ def current_composition(conn, job):
         if value == 0:
             continue
 
-        residual_rows.append({
-            "kind": (
-                "Saldo anterior parcialmente baixado"
-                if matched > 0
-                else "Saldo anterior detalhado"
-            ),
-            "value": str(value),
-            "date": item.get("trans_date", ""),
-            "nf": item.get("extracted_nf", ""),
-            "supplier": item.get("extracted_supplier", ""),
-            "history": item.get("history", ""),
-            "original": item["original"],
-            "matched_amount": item["matched_amount"],
-            "remaining_amount": item["remaining_amount"],
-            "status": item["status"],
-            "transaction_id": (
-                "OPENING:" + str(item["opening_index"])
-            ),
-            "origin": "SALDO_ANTERIOR"
-        })
+        if matched > 0:
+            orig_val = money(item["original"])
+            residual_rows.append({
+                "kind": "Saldo anterior parcialmente baixado (Crédito)",
+                "value": str(-orig_val),
+                "date": item.get("trans_date", ""),
+                "nf": item.get("extracted_nf", ""),
+                "supplier": item.get("extracted_supplier", ""),
+                "history": item.get("history", ""),
+                "original": str(orig_val),
+                "matched_amount": str(matched),
+                "remaining_amount": str(orig_val - matched),
+                "status": "PARCIALMENTE CONCILIADO",
+                "transaction_id": (
+                    "OPENING:" + str(item["opening_index"])
+                ),
+                "origin": "SALDO_ANTERIOR"
+            })
+            residual_rows.append({
+                "kind": "Baixa parcial do saldo anterior (Débito)",
+                "value": str(matched),
+                "date": item.get("trans_date", ""),
+                "nf": item.get("extracted_nf", ""),
+                "supplier": item.get("extracted_supplier", ""),
+                "history": f"Baixa parcial ref. saldo anterior NF {item.get('extracted_nf') or ''}: {item.get('history') or ''}",
+                "original": str(matched),
+                "matched_amount": str(matched),
+                "remaining_amount": "0.00",
+                "status": "BAIXA PARCIAL REGISTRADA",
+                "transaction_id": (
+                    "OPENING_MATCH:" + str(item["opening_index"])
+                ),
+                "origin": "SALDO_ANTERIOR"
+            })
+        else:
+            residual_rows.append({
+                "kind": "Saldo anterior detalhado",
+                "value": str(value),
+                "date": item.get("trans_date", ""),
+                "nf": item.get("extracted_nf", ""),
+                "supplier": item.get("extracted_supplier", ""),
+                "history": item.get("history", ""),
+                "original": item["original"],
+                "matched_amount": item["matched_amount"],
+                "remaining_amount": item["remaining_amount"],
+                "status": item["status"],
+                "transaction_id": (
+                    "OPENING:" + str(item["opening_index"])
+                ),
+                "origin": "SALDO_ANTERIOR"
+            })
 
     result["rows"] = residual_rows + result["rows"]
 

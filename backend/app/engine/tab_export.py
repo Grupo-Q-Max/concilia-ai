@@ -84,6 +84,8 @@ def make_workbook(sheets):
         "CONFIRMED": ("DCFCE7", "166534"),
         "PARCIAL": ("FEF3C7", "92400E"),
         "PARTIAL": ("FEF3C7", "92400E"),
+        "PARCIALMENTE CONCILIADO": ("FEF3C7", "92400E"),
+        "BAIXA PARCIAL REGISTRADA": ("DCFCE7", "166534"),
         "DIVERGENCIA_NF": ("FEE2E2", "991B1B"),
         "BAIXA_EVIDENCIA": ("FEE2E2", "991B1B"),
         "EM ABERTO": ("E0F2FE", "075985"),

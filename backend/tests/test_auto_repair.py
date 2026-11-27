@@ -61,5 +61,31 @@ class TestAutoRepairAndMultiFile(unittest.TestCase):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    def test_composition_partial_shows_both_debit_and_credit(self):
+        from app.engine.composition import composition
+        job = {'initial_balance': '0.00', 'final_reported_balance': '-208.32'}
+        tx = [
+            {
+                'id': 'tx1',
+                'trans_date': '2026-01-02',
+                'trans_type': 'CREDIT',
+                'amount': '4480.00',
+                'remaining_amount': '208.32',
+                'matched_amount': '4271.68',
+                'status': 'PARCIALMENTE_CONCILIADO',
+                'extracted_nf': '3301',
+                'extracted_supplier': 'SANTIFERR',
+                'history': 'ENTRADA NOTA FISCAL SANTIFERR'
+            }
+        ]
+        res = composition(job, tx)
+        self.assertEqual(len(res['rows']), 2)
+        kinds = [r['kind'] for r in res['rows']]
+        self.assertIn("Nota parcialmente baixada (Crédito)", kinds)
+        self.assertIn("Baixa parcial vinculada (Débito)", kinds)
+        total = sum(Decimal(r['value']) for r in res['rows'])
+        self.assertEqual(total, Decimal('-208.32'))
+        self.assertTrue(res['valid'])
+
 if __name__ == "__main__":
     unittest.main()

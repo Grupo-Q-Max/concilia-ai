@@ -2,12 +2,14 @@
 
 // CONCILIA_V5_EXPORT_BUTTON_24D
 import ExportSuggestionsButton from "@/components/ExportSuggestionsButton";
+import OpeningReconciliation from "@/components/OpeningReconciliation";
 
 import React, { useEffect, useRef, useState } from "react";
 import {
     Sparkles, CheckCircle2, AlertTriangle,
     RefreshCw, Search, ArrowRight, Loader2,
-    ChevronDown, ChevronUp, ChevronsUpDown, CheckCheck, X
+    ChevronDown, ChevronUp, ChevronsUpDown, CheckCheck, X,
+    FileSpreadsheet
 } from "lucide-react";
 import { api, getSmartSuggestions } from "@/lib/api";
 
@@ -50,6 +52,8 @@ interface Props {
     revision: number;
     jobId: string;
     onRefresh: () => Promise<void>;
+    initialBalance?: string;
+    composition?: any;
 }
 
 const money = (value: string | number) =>
@@ -115,9 +119,10 @@ export const displayNf = (nf?: string, history?: string): string => {
 };
 
 export default function SmartSuggestions({
-    jobId, onRefresh, revision
+    jobId, onRefresh, revision, initialBalance, composition
 }: Props) {
 
+    const [subTab, setSubTab] = useState<"current" | "opening">("current");
     const [items, setItems] = useState<Suggestion[]>([]);
     const [loading, setLoading] = useState(true);
     const [busy, setBusy] = useState(false);
@@ -424,6 +429,46 @@ export default function SmartSuggestions({
 
     return (
         <section className="space-y-4">
+
+            {/* SUB-TABS SELECTOR: EXERCICIO ATUAL vs SALDO ANTERIOR */}
+            <div className="flex border-b border-slate-200 gap-3 pb-0">
+                <button
+                    type="button"
+                    onClick={() => setSubTab("current")}
+                    className={`pb-3 px-3 text-sm font-bold flex items-center gap-2 border-b-2 transition-all cursor-pointer ${
+                        subTab === "current"
+                            ? "border-blue-600 text-blue-700"
+                            : "border-transparent text-slate-500 hover:text-slate-800"
+                    }`}
+                >
+                    <Sparkles className="w-4 h-4 text-sky-500" />
+                    <span>Lançamentos do Exercício Atual ({items.length})</span>
+                </button>
+                <button
+                    type="button"
+                    onClick={() => setSubTab("opening")}
+                    className={`pb-3 px-3 text-sm font-bold flex items-center gap-2 border-b-2 transition-all cursor-pointer ${
+                        subTab === "opening"
+                            ? "border-blue-600 text-blue-700"
+                            : "border-transparent text-slate-500 hover:text-slate-800"
+                    }`}
+                >
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                    <span>Saldo Anterior / Exercício Anterior</span>
+                </button>
+            </div>
+
+            {subTab === "opening" ? (
+                <OpeningReconciliation
+                    revision={revision}
+                    key={jobId}
+                    jobId={jobId}
+                    initialBalance={initialBalance || "0.00"}
+                    composition={composition}
+                    onRefresh={onRefresh}
+                />
+            ) : (
+                <>
 
             {/* EXPORT PANEL */}
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-4">
@@ -919,6 +964,9 @@ export default function SmartSuggestions({
                     </article>
                 );
             })}
+
+                </>
+            )}
 
         </section>
     );
