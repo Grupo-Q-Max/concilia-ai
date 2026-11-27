@@ -76,7 +76,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   onUploadSuccess
 }) => {
 
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const file = files[0] || null;
   const [step, setStep] = useState(0);
 
   const [preview, setPreview] =
@@ -137,7 +138,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
       request.current?.abort();
       resetProgress();
 
-      setFile(null);
+      setFiles([]);
       setStep(0);
       setPreview(null);
       setMapping({});
@@ -185,13 +186,13 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     onClose();
   };
 
-  const chooseFile = (selected: File | null) => {
+  const chooseFiles = (selected: FileList | File[] | null) => {
 
     if (locked.current) return;
 
     request.current?.abort();
 
-    setFile(null);
+    setFiles([]);
     setPreview(null);
     setValidation(null);
     setMapping({});
@@ -200,18 +201,26 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     setError("");
 
     if (!selected) return;
+    const list = Array.from(selected);
+    if (list.length === 0) return;
 
-    if (selected.size === 0) {
-      setError("A planilha está vazia.");
-      return;
+    for (const f of list) {
+      if (f.size === 0) {
+        setError(`A planilha '${f.name}' está vazia.`);
+        return;
+      }
+
+      if (f.size > 50 * 1024 * 1024) {
+        setError(`A planilha '${f.name}' ultrapassa 50 MB.`);
+        return;
+      }
     }
 
-    if (selected.size > 50 * 1024 * 1024) {
-      setError("A planilha ultrapassa 50 MB.");
-      return;
-    }
+    setFiles(list);
+  };
 
-    setFile(selected);
+  const chooseFile = (selected: File | null) => {
+    chooseFiles(selected ? [selected] : null);
   };
 
   const inspect = async (customHeader?: number) => {
@@ -409,7 +418,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     try {
 
       const result = await api.confirmImportV5(
-        file,
+        files.length > 1 ? files : file,
         validation
       );
 
@@ -539,39 +548,58 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             <>
 
               <label
-                className="relative block border-2 border-dashed border-slate-300 rounded-2xl p-12 text-center bg-slate-50 hover:border-blue-500 cursor-pointer"
+                className="relative block border-2 border-dashed border-slate-300 rounded-2xl p-10 text-center bg-slate-50 hover:border-blue-500 cursor-pointer transition-colors"
                 onDragOver={event => event.preventDefault()}
                 onDrop={event => {
                   event.preventDefault();
-                  chooseFile(
-                    event.dataTransfer.files[0] || null
-                  );
+                  chooseFiles(event.dataTransfer.files);
                 }}
               >
 
                 <input
                   type="file"
+                  multiple
                   accept=".xls,.xlsx,.xlsm,.xlsb,.csv,.html,.htm,.xml"
                   disabled={!!busy}
-                  onChange={event => chooseFile(
-                    event.target.files?.[0] || null
-                  )}
+                  onChange={event => chooseFiles(event.target.files)}
                   className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                 />
 
-                <FileSpreadsheet className="w-12 h-12 mx-auto text-emerald-600 mb-4" />
+                <FileSpreadsheet className="w-12 h-12 mx-auto text-emerald-600 mb-3" />
 
-                <p className="font-bold text-slate-800 break-all">
-                  {file
-                    ? file.name
-                    : "Selecione ou arraste sua planilha"}
-                </p>
+                {files.length > 1 ? (
+                  <div className="space-y-2">
+                    <p className="font-bold text-blue-700 text-base">
+                      {files.length} planilhas selecionadas para consolidação simultânea
+                    </p>
+                    <div className="flex flex-wrap justify-center gap-2 max-w-xl mx-auto py-1">
+                      {files.map((f, i) => (
+                        <span key={i} className="inline-flex items-center gap-1.5 px-3 py-1 bg-white border border-blue-200 rounded-lg text-xs font-semibold text-slate-700 shadow-sm">
+                          <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                          <span className="truncate max-w-[200px]">{f.name}</span>
+                          <span className="text-slate-400 font-normal">({(f.size / 1024).toFixed(0)} KB)</span>
+                        </span>
+                      ))}
+                    </div>
+                    <p className="text-xs text-blue-600 font-medium">
+                      ✨ Os lançamentos de ambos os arquivos serão unidos e auditados em uma única conciliação!
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <p className="font-bold text-slate-800 break-all">
+                      {file
+                        ? file.name
+                        : "Selecione ou arraste sua planilha (suporta 2 ou mais arquivos ao mesmo tempo)"}
+                    </p>
 
-                <p className="text-sm text-slate-500 mt-2">
-                  {file
-                    ? `${(file.size / 1024).toFixed(1)} KB`
-                    : "Excel ou CSV — até 50 MB"}
-                </p>
+                    <p className="text-sm text-slate-500 mt-2">
+                      {file
+                        ? `${(file.size / 1024).toFixed(1)} KB`
+                        : "Excel ou CSV — selecione 1 ou múltiplos arquivos (ex: 2 meses ou filiais)"}
+                    </p>
+                  </>
+                )}
 
               </label>
 

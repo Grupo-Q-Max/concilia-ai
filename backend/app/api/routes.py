@@ -930,18 +930,19 @@ def reprocess_job(job_id: str):
 
 @router.post("/upload")
 async def upload_and_process_ledger(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
     header_row: Optional[int] = Form(None),
     column_mapping: Optional[str] = Form(None),
     mapping_fingerprint: Optional[str] = Form(None),
 ):
     """
-    Receives an accounting ledger (.xls, .xlsx, .csv), parses transactions,
+    Receives one or more accounting ledgers (.xls, .xlsx, .csv), parses transactions,
     performs mathematical audit, and runs automatic reconciliation.
+    Supports multi-file consolidation (e.g. 2 months or 2 branches together).
     """
     # CONCILIA_V5_IMPORT_CONFIRM_29D32
     from app.operations_security_v5 import validate_uploaded_file_v5
-    validate_uploaded_file_v5(file)
     import hashlib
     import re
     from pathlib import Path
@@ -952,27 +953,19 @@ async def upload_and_process_ledger(
         MAX_BYTES,
     )
 
+    upload_list: List[UploadFile] = []
+    if files:
+        upload_list.extend([f for f in files if f and f.filename])
+    if file and file.filename and file not in upload_list:
+        upload_list.append(file)
+
+    if not upload_list:
+        raise HTTPException(400, "Nenhum arquivo enviado.")
+
+    for f in upload_list:
+        validate_uploaded_file_v5(f)
+
     job_id = str(uuid.uuid4())
-    filename = Path(
-        (file.filename or "ledger.xls")
-        .replace("\\\\", "/")
-    ).name
-
-    suffix = Path(filename).suffix.lower()
-
-    if suffix not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            400, "Formato de planilha nao suportado."
-        )
-
-    safe_name = re.sub(
-        r'[^A-Za-z0-9_.-]', '_', filename
-    )[:120]
-
-    saved_path = UPLOAD_DIR / (
-        f"{job_id}_{safe_name}{suffix}"
-    )
-
     mapped = any(
         value is not None
         for value in (
@@ -986,109 +979,187 @@ async def upload_and_process_ledger(
     conn = None
     committed = False
 
+    mapping = None
+    if mapped:
+        if (
+            header_row is None
+            or not column_mapping
+            or not mapping_fingerprint
+        ):
+            raise HTTPException(
+                400,
+                "Mapeamento ou confirmacao incompleta."
+            )
+
+        try:
+            mapping = json.loads(column_mapping)
+            if not isinstance(mapping, dict):
+                raise ValueError("Mapeamento invalido.")
+
+            upload_list[0].file.seek(0)
+            validation = validate_upload_v5(
+                upload_list[0], header_row, mapping
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                "Mapeamento invalido: " + str(exc)
+            ) from exc
+
+        if not validation["valid"]:
+            raise HTTPException(
+                422,
+                "Validacao contabil nao aprovada."
+            )
+
+        if validation["mapping_fingerprint"] != mapping_fingerprint:
+            raise HTTPException(
+                409,
+                "Arquivo ou mapeamento alterado. Valide novamente."
+            )
+
+        import_config = {
+            "header_row": header_row,
+            "mapping": mapping,
+            "file_hash": validation["file_hash"],
+            "mapping_fingerprint": mapping_fingerprint,
+        }
+
     try:
-        if mapped:
-            if (
-                header_row is None
-                or not column_mapping
-                or not mapping_fingerprint
-            ):
-                raise HTTPException(
-                    400,
-                    "Mapeamento ou confirmacao incompleta."
+        if len(upload_list) == 1:
+            single_f = upload_list[0]
+            filename = Path((single_f.filename or "ledger.xls").replace("\\\\", "/")).name
+            suffix = Path(filename).suffix.lower()
+            if suffix not in ALLOWED_EXTENSIONS:
+                raise HTTPException(400, "Formato de planilha nao suportado.")
+
+            safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', filename)[:120]
+            saved_path = UPLOAD_DIR / f"{job_id}_{safe_name}{suffix}"
+
+            single_f.file.seek(0)
+            digest = hashlib.sha256()
+            total = 0
+
+            with saved_path.open("xb") as buffer:
+                while True:
+                    chunk = single_f.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_BYTES:
+                        raise HTTPException(413, "Planilha acima de 50 MB.")
+                    digest.update(chunk)
+                    buffer.write(chunk)
+
+            if not total:
+                raise HTTPException(400, "Planilha vazia.")
+
+            if mapped:
+                if digest.hexdigest() != import_config["file_hash"]:
+                    raise HTTPException(409, "Arquivo alterado.")
+                parse_result = parse_accounting_ledger(
+                    str(saved_path),
+                    header_row=header_row,
+                    column_mapping=mapping,
                 )
+            else:
+                parse_result = parse_accounting_ledger(str(saved_path))
 
-            try:
-                mapping = json.loads(column_mapping)
-
-                if not isinstance(mapping, dict):
-                    raise ValueError("Mapeamento invalido.")
-
-                file.file.seek(0)
-
-                validation = validate_upload_v5(
-                    file, header_row, mapping
-                )
-
-            except HTTPException:
-                raise
-
-            except Exception as exc:
-                raise HTTPException(
-                    400,
-                    "Mapeamento invalido: " + str(exc)
-                ) from exc
-
-            if not validation["valid"]:
-                raise HTTPException(
-                    422,
-                    "Validacao contabil nao aprovada."
-                )
-
-            if (
-                validation["mapping_fingerprint"]
-                != mapping_fingerprint
-            ):
-                raise HTTPException(
-                    409,
-                    "Arquivo ou mapeamento alterado. "
-                    "Valide novamente."
-                )
-
-            import_config = {
-                "header_row": header_row,
-                "mapping": mapping,
-                "file_hash": validation["file_hash"],
-                "mapping_fingerprint":
-                    mapping_fingerprint,
-            }
-
-        file.file.seek(0)
-
-        digest = hashlib.sha256()
-        total = 0
-
-        with saved_path.open("xb") as buffer:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                total += len(chunk)
-
-                if total > MAX_BYTES:
-                    raise HTTPException(
-                        413, "Planilha acima de 50 MB."
-                    )
-
-                digest.update(chunk)
-                buffer.write(chunk)
-
-        if not total:
-            raise HTTPException(400, "Planilha vazia.")
-
-        if mapped:
-            if (
-                digest.hexdigest()
-                != import_config["file_hash"]
-            ):
-                raise HTTPException(
-                    409, "Arquivo alterado."
-                )
-
-            parse_result = parse_accounting_ledger(
-                str(saved_path),
-                header_row=header_row,
-                column_mapping=mapping,
-            )
+            metadata = parse_result["metadata"]
+            raw_transactions = parse_result["transactions"]
         else:
-            parse_result = parse_accounting_ledger(
-                str(saved_path)
-            )
+            # Multi-file upload consolidation
+            parsed_ledgers = []
+            file_names = []
+            for idx, mf in enumerate(upload_list):
+                mf_name = Path((mf.filename or f"ledger_{idx}.xls").replace("\\\\", "/")).name
+                mf_suffix = Path(mf_name).suffix.lower()
+                if mf_suffix not in ALLOWED_EXTENSIONS:
+                    raise HTTPException(400, f"Formato de '{mf_name}' nao suportado.")
+                mf_safe = re.sub(r'[^A-Za-z0-9_.-]', '_', mf_name)[:60]
+                file_names.append(mf_name)
+                mf_saved_path = UPLOAD_DIR / f"{job_id}_{idx}_{mf_safe}{mf_suffix}"
 
-        metadata = parse_result["metadata"]
-        raw_transactions = parse_result["transactions"]
+                mf.file.seek(0)
+                mf_total = 0
+                with mf_saved_path.open("xb") as buffer:
+                    while True:
+                        chunk = mf.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        mf_total += len(chunk)
+                        if mf_total > MAX_BYTES:
+                            raise HTTPException(413, f"Planilha '{mf_name}' acima de 50 MB.")
+                        buffer.write(chunk)
+
+                if not mf_total:
+                    raise HTTPException(400, f"Planilha '{mf_name}' esta vazia.")
+
+                if mapped and mapping:
+                    pres = parse_accounting_ledger(
+                        str(mf_saved_path),
+                        header_row=header_row,
+                        column_mapping=mapping,
+                    )
+                else:
+                    pres = parse_accounting_ledger(str(mf_saved_path))
+                parsed_ledgers.append(pres)
+
+            # Consolidate transactions
+            all_raw_transactions = []
+            row_count = 0
+            total_credits = Decimal('0.00')
+            total_debits = Decimal('0.00')
+
+            for pres in parsed_ledgers:
+                for t in pres["transactions"]:
+                    t_copy = dict(t)
+                    t_copy["id"] = str(uuid.uuid4())
+                    t_copy["row_index"] = row_count
+                    row_count += 1
+                    all_raw_transactions.append(t_copy)
+                    if t["trans_type"] == "CREDIT":
+                        total_credits += Decimal(str(t["amount"]))
+                    else:
+                        total_debits += Decimal(str(t["amount"]))
+
+            first_meta = parsed_ledgers[0]["metadata"]
+            last_meta = parsed_ledgers[-1]["metadata"]
+            first_initial = Decimal(str(first_meta.get("initial_balance") or "0.00"))
+            last_final = Decimal(str(last_meta.get("final_reported_balance") or "0.00"))
+
+            sum_initials = sum(Decimal(str(p["metadata"].get("initial_balance") or "0.00")) for p in parsed_ledgers)
+            sum_finals = sum(Decimal(str(p["metadata"].get("final_reported_balance") or "0.00")) for p in parsed_ledgers)
+
+            if abs(first_initial + total_credits - total_debits - last_final) <= Decimal('0.05'):
+                comb_initial = first_initial
+                comb_final = last_final
+            elif abs(sum_initials + total_credits - total_debits - sum_finals) <= Decimal('0.05'):
+                comb_initial = sum_initials
+                comb_final = sum_finals
+            else:
+                comb_initial = first_initial
+                comb_final = first_initial + total_credits - total_debits
+
+            periods = [str(p["metadata"].get("period") or "").strip() for p in parsed_ledgers if p["metadata"].get("period")]
+            combined_period = " + ".join(dict.fromkeys(periods)) if periods else (first_meta.get("period") or "")
+
+            metadata = {
+                "company_name": first_meta.get("company_name") or "CONSOLIDAÇÃO MULTI-PLANILHAS",
+                "cnpj": first_meta.get("cnpj") or "",
+                "period": combined_period,
+                "account_code": first_meta.get("account_code") or "",
+                "initial_balance": comb_initial,
+                "final_reported_balance": comb_final,
+                "total_credits": total_credits,
+                "total_debits": total_debits,
+                "period_net_movement": total_credits - total_debits,
+            }
+            raw_transactions = all_raw_transactions
+            filename = f"Consolidado ({len(upload_list)} arquivos): " + ", ".join(file_names)[:100]
+            saved_path = UPLOAD_DIR / f"{job_id}_consolidado.xls"
         
         # 2. Mathematical Audit
         math_audit = audit_accounting_balance(

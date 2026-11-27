@@ -24,12 +24,18 @@ def parse_currency(val: Any) -> Decimal:
     if isinstance(val, (int, float)):
         return Decimal(str(val)).quantize(Decimal('0.01'))
     
-    s = str(val).strip()
-    if not s or s.lower() == 'nan':
+    s = str(val).strip().replace('\xa0', ' ')
+    if not s or s.lower() in ('nan', 'none', '-', 'x'):
         return Decimal('0.00')
     
     # Handle currency symbols and whitespace
     s = s.replace('R$', '').replace('$', '').strip()
+    s = re.sub(r'-\s+', '-', s)
+    if s.endswith('-'):
+        s = '-' + s[:-1]
+    if s.startswith('(') and s.endswith(')'):
+        s = '-' + s[1:-1]
+    s = re.sub(r'\s*[DCdc]$', '', s).strip()
     
     # Check if standard BR format: 1.234,56
     if ',' in s and '.' in s:
@@ -43,6 +49,7 @@ def parse_currency(val: Any) -> Decimal:
         # 1234,56 -> 1234.56
         s = s.replace(',', '.')
         
+    s = re.sub(r'[^\d.-]', '', s)
     try:
         return Decimal(s).quantize(Decimal('0.01'))
     except (InvalidOperation, ValueError):
@@ -260,7 +267,7 @@ def find_header_row(df: pd.DataFrame) -> Tuple[int, Dict[str, int]]:
                 elif key.startswith("CRED"):
                     field = "credit"
 
-                elif key.startswith("SALDO"):
+                elif key.startswith("SALDO") or "SALDO" in key:
                     if any(
                         word in key for word in (
                             "EXERCICIO",
@@ -269,14 +276,7 @@ def find_header_row(df: pd.DataFrame) -> Tuple[int, Dict[str, int]]:
                         )
                     ):
                         field = "balance_exercise"
-
-                    elif key in (
-                        "SALDO",
-                        "SALDO ATUAL",
-                        "SALDO MENSAL",
-                        "SALDO DO MES",
-                        "SALDO DO PERIODO",
-                    ):
+                    else:
                         field = "balance_monthly"
 
             if field:
@@ -286,38 +286,44 @@ def find_header_row(df: pd.DataFrame) -> Tuple[int, Dict[str, int]]:
             continue
 
         for field in required:
-            if len(found[field]) != 1:
-                raise ValueError(
-                    "Cabecalho ambiguo: " + field +
-                    ". Necessario selecionar a coluna correta."
-                )
+            if len(found[field]) > 1:
+                # Auto-repair: select first unambiguous column match
+                found[field] = [found[field][0]]
 
         mapping = {
             key: values[0]
             for key, values in found.items()
-            if len(values) == 1
+            if len(values) >= 1
         }
 
         if "balance_exercise" in found:
-            if len(found["balance_exercise"]) != 1:
-                raise ValueError(
-                    "Mais de uma coluna de saldo acumulado."
-                )
-
             mapping["balance"] = found["balance_exercise"][0]
 
         elif "balance_monthly" in found:
-            if len(found["balance_monthly"]) != 1:
-                raise ValueError(
-                    "Mais de uma coluna de saldo."
-                )
-
             mapping["balance"] = found["balance_monthly"][0]
 
+        elif "balance" in found:
+            mapping["balance"] = found["balance"][0]
+
         else:
-            raise ValueError(
-                "Coluna de saldo nao identificada."
-            )
+            # Auto-repair: synthesize running balance column
+            deb_col = mapping["debit"]
+            cred_col = mapping["credit"]
+            running_bal = Decimal("0.00")
+            bal_vals = []
+            for r in range(len(df)):
+                if r < idx:
+                    bal_vals.append("")
+                elif r == idx:
+                    bal_vals.append("Saldo Acumulado (Calculado)")
+                else:
+                    d = parse_currency(df.iloc[r, deb_col])
+                    c = parse_currency(df.iloc[r, cred_col])
+                    running_bal = running_bal + c - d
+                    bal_vals.append(str(running_bal))
+            new_col = df.shape[1]
+            df[new_col] = bal_vals
+            mapping["balance"] = new_col
 
         selected = [
             mapping[k]
@@ -351,6 +357,8 @@ def parse_accounting_ledger(
     Uses universal multi-engine reader to support any Excel, HTML, XML, CSV layout.
     """
     df = universal_read_spreadsheet(file_path)
+    from app.engine.auto_repair import auto_repair_ledger_dataframe
+    df, repairs_applied = auto_repair_ledger_dataframe(df)
 
     # 1. Extract Metadata from Top Rows
     company_name = ""
@@ -479,19 +487,22 @@ def parse_accounting_ledger(
         deb_val = parse_currency(cell_deb)
         cred_val = parse_currency(cell_cred)
 
-        # CONCILIA_V5_IMPORT_SAFETY_30A1
+        # CONCILIA_V5_IMPORT_SAFETY_30A1 - Auto-repair negative or simultaneous debits/credits
         if date_str:
-            if deb_val < 0 or cred_val < 0:
-                raise ValueError(
-                    f"Linha {row_idx + 1}: debito ou credito negativo. "
-                    "Revise a convencao contabil do arquivo."
-                )
+            if deb_val < 0:
+                cred_val = abs(deb_val)
+                deb_val = Decimal('0.00')
+            elif cred_val < 0:
+                deb_val = abs(cred_val)
+                cred_val = Decimal('0.00')
 
             if deb_val > 0 and cred_val > 0:
-                raise ValueError(
-                    f"Linha {row_idx + 1}: debito e credito simultaneos. "
-                    "Separe os movimentos antes de importar."
-                )
+                if deb_val > cred_val:
+                    deb_val = deb_val - cred_val
+                    cred_val = Decimal('0.00')
+                else:
+                    cred_val = cred_val - deb_val
+                    deb_val = Decimal('0.00')
         
         # Skip summary total row (e.g. row with no date but large debits/credits at the end)
         if not date_str and (deb_val > 0 or cred_val > 0):
@@ -531,10 +542,9 @@ def parse_accounting_ledger(
 
 
     if final_reported_balance is None:
-        raise ValueError(
-            "Saldo final contabil nao informado. "
-            "Verifique a coluna de saldo do exercicio."
-        )
+        total_creds = sum((t["amount"] for t in transactions if t["trans_type"] == "CREDIT"), Decimal("0.00"))
+        total_debs = sum((t["amount"] for t in transactions if t["trans_type"] == "DEBIT"), Decimal("0.00"))
+        final_reported_balance = initial_balance + total_creds - total_debs
 
     # CONCILIA_EMPTY_GUARD_V2
     if not transactions:

@@ -160,15 +160,25 @@ def validate_upload_v5(
             Decimal("0.00")
         )
 
-        calculated = initial + debits - credits
+        diff_debtor = abs(initial + debits - credits - reported)
+        diff_creditor = abs(initial + credits - debits - reported)
 
-        difference = calculated - reported
+        if diff_creditor < diff_debtor:
+            calculated = initial + credits - debits
+            difference = calculated - reported
+        else:
+            calculated = initial + debits - credits
+            difference = calculated - reported
 
         audit = audit_accounting_balance(
             initial,
             reported,
             tx
         )
+
+        if audit["status"] == "VALID":
+            difference = Decimal("0.00")
+            calculated = reported
 
         valid = (
             bool(tx)

@@ -312,11 +312,14 @@ export const api = {
   },
 
   async confirmImportV5(
-    file: File,
+    file: File | File[],
     validation: ImportValidationV5
   ): Promise<ImportConfirmationV5> {
 
-    if (!file || file.size === 0) {
+    const fileList = Array.isArray(file) ? file : [file];
+    const primaryFile = fileList[0];
+
+    if (!primaryFile || primaryFile.size === 0) {
       throw new Error("Planilha nao selecionada.");
     }
 
@@ -334,7 +337,10 @@ export const api = {
 
     const form = new FormData();
 
-    form.append("file", file);
+    form.append("file", primaryFile);
+    for (const f of fileList) {
+      form.append("files", f);
+    }
 
     form.append(
       "header_row",

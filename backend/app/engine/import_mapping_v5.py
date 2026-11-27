@@ -96,6 +96,9 @@ def inspect_ledger_v5(file_path, header_row=None):
     if df.empty:
         raise ValueError("Planilha vazia.")
 
+    from app.engine.auto_repair import auto_repair_ledger_dataframe
+    df, repairs = auto_repair_ledger_dataframe(df)
+
     detected = None
     warning = None
 
@@ -160,5 +163,6 @@ def inspect_ledger_v5(file_path, header_row=None):
         "sample": sample,
         "automatic_mapping": detected,
         "requires_manual_mapping": detected is None,
-        "warning": warning
+        "warning": warning,
+        "repairs": repairs
     }
