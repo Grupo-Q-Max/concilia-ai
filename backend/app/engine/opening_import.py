@@ -17,22 +17,28 @@ def parse_date_safely(val):
         return None
     if isinstance(val, (datetime, date)):
         return val.strftime('%Y-%m-%d')
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if 30000 <= val <= 60000:
+            dt = pd.to_datetime(val, unit='D', origin='1899-12-30')
+            return dt.strftime('%Y-%m-%d')
     s = str(val).strip()
     if not s or s.upper() in ('X', '-', 'NAN', 'NONE', ''):
         return None
-    try:
-        f = float(s)
-        if 30000 <= f <= 60000:
-            dt = pd.to_datetime(f, unit='D', origin='1899-12-30')
-            return dt.strftime('%Y-%m-%d')
-    except (ValueError, OverflowError):
-        pass
+    if re.match(r'^\d{5}\.\d+$', s):
+        try:
+            f = float(s)
+            if 30000 <= f <= 60000:
+                dt = pd.to_datetime(f, unit='D', origin='1899-12-30')
+                return dt.strftime('%Y-%m-%d')
+        except (ValueError, OverflowError):
+            pass
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            dt = pd.to_datetime(s, dayfirst=True, errors='coerce')
-            if pd.notna(dt):
-                return dt.strftime('%Y-%m-%d')
+            if re.search(r'[\/\.\-]', s) or (len(s) == 8 and s.isdigit()):
+                dt = pd.to_datetime(s, dayfirst=True, errors='coerce')
+                if pd.notna(dt):
+                    return dt.strftime('%Y-%m-%d')
     except Exception:
         pass
     return None
@@ -54,15 +60,17 @@ def detect_column_mapping(norm_cells):
     # Tabular layout with Date, History, Amounts (like Razão / Conciliação de Fornecedores)
     has_date = any(c in ('data', 'emissao', 'dt', 'data emissao', 'dt emissao', 'vencimento') for c in norm_cells)
     has_hist = any(c in ('historico', 'descricao', 'hist', 'detalhe', 'complemento') for c in norm_cells)
+    has_doc_or_nf = any(c in ('nota', 'nf', 'numero', 'nota fiscal', 'titulo', 'documento', 'doc', 'fornecedor') for c in norm_cells)
+    has_amount = any(c in ('valor', 'debito', 'credito', 'saldo', 'total', 'debito/valor', 'saldo anterior', 'valor nominal', 'formula') for c in norm_cells)
 
-    if has_date and has_hist:
+    if (has_date and has_hist) or (has_date and has_doc_or_nf) or (has_date and has_amount) or (has_hist and has_amount) or (has_doc_or_nf and has_amount):
         m = {'type': 'table'}
         for idx, c in enumerate(norm_cells):
-            if c in ('data', 'emissao', 'dt', 'data emissao', 'dt emissao') and 'date' not in m:
+            if c in ('data', 'emissao', 'dt', 'data emissao', 'dt emissao', 'vencimento') and 'date' not in m:
                 m['date'] = idx
             elif c in ('lt', 'lote', 'documento', 'doc') and 'doc' not in m:
                 m['doc'] = idx
-            elif c in ('historico', 'descricao', 'hist') and 'history' not in m:
+            elif c in ('historico', 'descricao', 'hist', 'detalhe', 'complemento') and 'history' not in m:
                 m['history'] = idx
             elif c in ('nota', 'nf', 'numero', 'nota fiscal', 'titulo') and 'nf' not in m:
                 m['nf'] = idx
@@ -81,19 +89,98 @@ def detect_column_mapping(norm_cells):
     return None
 
 
+def is_numeric_cell(val):
+    if pd.isna(val) or val is None:
+        return False
+    s = str(val).strip()
+    s_clean = re.sub(r'^(?:R\$|USD|\$)\s*', '', s, flags=re.I).strip()
+    return bool(re.match(r'^-?[\d\.,\s]+$', s_clean)) and any(c.isdigit() for c in s_clean)
+
+
+def infer_headerless_mapping(df):
+    if df.empty:
+        return None
+    sample_rows = []
+    for r_idx in range(min(10, len(df))):
+        row = df.iloc[r_idx]
+        cells = [str(c).strip() if pd.notna(c) else '' for c in row]
+        if any(cells):
+            if detect_column_mapping([norm(c) for c in cells]):
+                return None
+            sample_rows.append(cells)
+            if len(sample_rows) >= 3:
+                break
+    if not sample_rows:
+        return None
+
+    num_cols = len(df.columns)
+    date_cols = [
+        c for c in range(num_cols)
+        if all(parse_date_safely(r[c]) for r in sample_rows if c < len(r) and r[c])
+        and any(parse_date_safely(r[c]) for r in sample_rows if c < len(r) and r[c])
+    ]
+    val_cols = [c for c in range(num_cols) if c not in date_cols and any(is_numeric_cell(r[c]) and parse_currency(r[c]) > 0 for r in sample_rows if c < len(r) and r[c])]
+
+    if not val_cols and not date_cols:
+        return None
+
+    if num_cols == 3:
+        if 0 in date_cols:
+            if 2 in val_cols:
+                return {'type': 'table', 'date': 0, 'history': 1, 'value': 2}
+            elif 1 in val_cols:
+                return {'type': 'table', 'date': 0, 'value': 1, 'history': 2}
+        elif 1 in date_cols and 2 in val_cols:
+            return {'type': 'table', 'history': 0, 'date': 1, 'value': 2}
+        elif 2 in val_cols:
+            return {'type': 'table', 'doc': 0, 'history': 1, 'value': 2}
+
+    elif num_cols == 4:
+        if 0 in date_cols:
+            if 3 in val_cols:
+                return {'type': 'simple_4', 'date': 0, 'doc': 1, 'history': 2, 'value': 3}
+            elif 2 in val_cols and 3 in val_cols:
+                return {'type': 'table', 'date': 0, 'history': 1, 'debit': 2, 'credit': 3}
+        elif 3 in val_cols:
+            return {'type': 'simple_4', 'date': 0 if 0 in date_cols else None, 'doc': 1, 'history': 2, 'value': 3}
+
+    elif num_cols == 2:
+        if 1 in val_cols:
+            if 0 in date_cols:
+                return {'type': 'table', 'date': 0, 'value': 1}
+            else:
+                return {'type': 'table', 'history': 0, 'value': 1}
+
+    if val_cols:
+        best_val = val_cols[-1]
+        best_date = date_cols[0] if date_cols else None
+        remaining = [c for c in range(num_cols) if c != best_val and c != best_date]
+        m = {'type': 'table', 'value': best_val}
+        if best_date is not None:
+            m['date'] = best_date
+        if len(remaining) == 1:
+            m['history'] = remaining[0]
+        elif len(remaining) >= 2:
+            m['doc'] = remaining[0]
+            m['history'] = remaining[1]
+        return m
+
+    return None
+
+
 def read_opening(path, initial=None):
     dfs = []
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            excel_file = pd.ExcelFile(path)
-            for sname in excel_file.sheet_names:
-                try:
-                    sheet_df = pd.read_excel(excel_file, sheet_name=sname, header=None).dropna(how='all').dropna(axis=1, how='all')
-                    if not sheet_df.empty and len(sheet_df) >= 1:
-                        dfs.append((sname, sheet_df))
-                except Exception:
-                    pass
+            with pd.ExcelFile(path) as excel_file:
+                for sname in excel_file.sheet_names:
+                    try:
+                        sheet_df = pd.read_excel(excel_file, sheet_name=sname, header=None).dropna(how='all').dropna(axis=1, how='all')
+                        if not sheet_df.empty and len(sheet_df) >= 1:
+                            dfs.append((sname, sheet_df))
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -107,15 +194,7 @@ def read_opening(path, initial=None):
 
     for sheet_name, df in dfs:
         rows = []
-        current_map = None
-
-        if len(df.columns) == 4:
-            first_cells = [norm(v) for v in df.iloc[0]]
-            has_header = first_cells[0] in ('data', 'emissao', 'data emissao') and first_cells[2] in ('historico', 'descricao')
-            if not has_header:
-                first_date = parse_date_safely(df.iloc[0, 0])
-                if first_date:
-                    current_map = {'type': 'simple_4', 'date': 0, 'doc': 1, 'history': 2, 'value': 3}
+        current_map = infer_headerless_mapping(df)
 
         for r_idx in range(len(df)):
             row = df.iloc[r_idx]
@@ -162,16 +241,16 @@ def read_opening(path, initial=None):
                 })
 
             elif cmap['type'] in ('table', 'simple_4'):
-                raw_date = cells[cmap['date']] if 'date' in cmap and cmap['date'] < len(cells) else ''
-                raw_hist = cells[cmap['history']] if 'history' in cmap and cmap['history'] < len(cells) else ''
-                raw_doc = cells[cmap['doc']] if 'doc' in cmap and cmap['doc'] < len(cells) else ''
-                raw_nf = cells[cmap['nf']] if 'nf' in cmap and cmap['nf'] < len(cells) else ''
-                raw_sup = cells[cmap['supplier']] if 'supplier' in cmap and cmap['supplier'] < len(cells) else ''
-                raw_nat = norm(cells[cmap['nature']]) if 'nature' in cmap and cmap['nature'] < len(cells) else ''
+                raw_date = cells[cmap['date']] if cmap.get('date') is not None and cmap['date'] < len(cells) else ''
+                raw_hist = cells[cmap['history']] if cmap.get('history') is not None and cmap['history'] < len(cells) else ''
+                raw_doc = cells[cmap['doc']] if cmap.get('doc') is not None and cmap['doc'] < len(cells) else ''
+                raw_nf = cells[cmap['nf']] if cmap.get('nf') is not None and cmap['nf'] < len(cells) else ''
+                raw_sup = cells[cmap['supplier']] if cmap.get('supplier') is not None and cmap['supplier'] < len(cells) else ''
+                raw_nat = norm(cells[cmap['nature']]) if cmap.get('nature') is not None and cmap['nature'] < len(cells) else ''
 
-                raw_val = cells[cmap['value']] if 'value' in cmap and cmap['value'] < len(cells) else ''
-                raw_deb = cells[cmap['debit']] if 'debit' in cmap and cmap['debit'] < len(cells) else ''
-                raw_cred = cells[cmap['credit']] if 'credit' in cmap and cmap['credit'] < len(cells) else ''
+                raw_val = cells[cmap['value']] if cmap.get('value') is not None and cmap['value'] < len(cells) else ''
+                raw_deb = cells[cmap['debit']] if cmap.get('debit') is not None and cmap['debit'] < len(cells) else ''
+                raw_cred = cells[cmap['credit']] if cmap.get('credit') is not None and cmap['credit'] < len(cells) else ''
 
                 if not raw_hist and not raw_val and not raw_deb and not raw_cred:
                     continue
@@ -230,7 +309,14 @@ def read_opening(path, initial=None):
                         nf_val = fb
 
                 supplier_val = raw_sup if raw_sup else (info.get('extracted_supplier') or raw_hist)
-                supplier_val = re.sub(r'^(?:ENTRADA|AQUISICAO|DEVOLUCAO|PGTO|PAGAMENTO)\s+(?:CONFORME\s+)?(?:NOTA\s+FISCAL|NF)?\s*', '', supplier_val, flags=re.I).strip()
+                supplier_cleaned = re.sub(r'^(?:ENTRADA|AQUISICAO|DEVOLUCAO|PGTO|PAGAMENTO)\s+(?:CONFORME\s+)?(?:NOTA\s+FISCAL|NF)?\s*', '', supplier_val, flags=re.I).strip()
+                if not raw_sup:
+                    if not supplier_cleaned or supplier_cleaned == nf_val or supplier_cleaned.isdigit() or norm(supplier_cleaned) in ('', 'sn', '0', 's/n'):
+                        supplier_val = raw_hist
+                    else:
+                        supplier_val = supplier_cleaned
+                else:
+                    supplier_val = supplier_cleaned or raw_sup
 
                 rows.append({
                     'extracted_supplier': str(supplier_val),
