@@ -768,6 +768,7 @@ export interface ImportPreviewV5 {
   } | null;
   requires_manual_mapping: boolean;
   warning: string | null;
+  repairs?: string[];
 }
 
 export interface ImportValidationV5 {

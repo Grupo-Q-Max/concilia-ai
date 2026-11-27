@@ -649,6 +649,20 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
               </div>
 
+              {preview.repairs && preview.repairs.length > 0 && (
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold text-emerald-700">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    <span>Auto-Reparo Ativo: Planilha corrigida e padronizada automaticamente</span>
+                  </div>
+                  <ul className="list-disc list-inside text-emerald-700 pl-1 space-y-0.5">
+                    {preview.repairs.map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-end gap-3 bg-slate-50 border border-slate-200 rounded-xl p-4">
 
                 <label className="text-sm font-medium text-slate-700">
