@@ -29,7 +29,8 @@ import {
   CheckCheck,
   Loader2,
   AlertCircle,
-  CheckCircle2
+  CheckCircle2,
+  X
 } from "lucide-react";
 
 type Props = {
@@ -82,6 +83,7 @@ export default function OpeningReconciliation({
   const [uploadError, setUploadError] = useState("");
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [selectedUploadFile, setSelectedUploadFile] = useState<File | null>(null);
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
 
   const lock = useRef(false);
   const request = useRef(0);
@@ -215,17 +217,40 @@ export default function OpeningReconciliation({
     setIsUploadModalOpen(true);
   };
 
+  const getItemKey = (item: OpeningSuggestionV5) =>
+    `${item.opening_index}:${item.payment_trans_id}`;
+
   const eligibleItems = (data?.items || []).filter(
     item => item.automatic_eligible && !item.ambiguous && !item.current_conflict
   );
 
-  const handleBatchApprove = async () => {
-    if (lock.current || busy || loading || eligibleItems.length === 0) return;
+  const selectedItems = (data?.items || []).filter(item =>
+    selectedKeys.has(getItemKey(item))
+  );
 
-    if (!window.confirm(
-      `Deseja aprovar automaticamente ${eligibleItems.length} baixas compatíveis do saldo anterior?\n` +
-      `O saldo contábil e as composições serão preservados.`
-    )) return;
+  const totalSelectedAmount = selectedItems.reduce((acc, item) => {
+    return acc + Math.min(Number(item.opening_amount || 0), Number(item.payment_amount || 0));
+  }, 0);
+
+  const handleBatchApprove = async (
+    itemsToApprove: OpeningSuggestionV5[],
+    mode: "COMPATIBLE" | "SELECTED" = "COMPATIBLE"
+  ) => {
+    if (lock.current || busy || loading || itemsToApprove.length === 0) return;
+
+    const count = itemsToApprove.length;
+    const reviewCount = itemsToApprove.filter(
+      s => s.ambiguous || s.current_conflict || s.category !== "EXATO"
+    ).length;
+
+    const confirmMsg =
+      mode === "SELECTED"
+        ? reviewCount > 0
+          ? `Confirmar aprovação simultânea de ${count} baixa(s) selecionada(s)? (${reviewCount} possuem observações/divergências e serão confirmadas).`
+          : `Confirmar aprovação simultânea de ${count} baixa(s) do saldo anterior selecionada(s)?`
+        : `Deseja aprovar automaticamente ${count} baixas compatíveis do saldo anterior?\nO saldo contábil e as composições serão preservados.`;
+
+    if (!window.confirm(confirmMsg)) return;
 
     lock.current = true;
     setBusy(true);
@@ -236,13 +261,13 @@ export default function OpeningReconciliation({
     const failed: string[] = [];
 
     try {
-      for (let i = 0; i < eligibleItems.length; i++) {
-        const item = eligibleItems[i];
+      for (let i = 0; i < itemsToApprove.length; i++) {
+        const item = itemsToApprove[i];
         const nf = displayNf(item.opening_nf, rows[item.opening_index]?.history);
         const amount = fmt(Math.min(Number(item.opening_amount), Number(item.payment_amount)));
 
         setBatchProgress({
-          total: eligibleItems.length,
+          total: itemsToApprove.length,
           current: i + 1,
           currentNf: nf,
           currentAmount: amount
@@ -252,6 +277,11 @@ export default function OpeningReconciliation({
           const res = await approveOpeningV5(jobId, item);
           if (res.success) {
             completed++;
+            setSelectedKeys(prev => {
+              const next = new Set(prev);
+              next.delete(getItemKey(item));
+              return next;
+            });
           } else {
             failed.push(`NF ${nf}: ${res.detail || "Falha ao registrar baixa."}`);
           }
@@ -322,6 +352,44 @@ export default function OpeningReconciliation({
     return text.includes(search.toLowerCase());
 
   });
+
+  const visibleItems = filtered.slice(0, limit);
+  const allVisibleSelected =
+    visibleItems.length > 0 &&
+    visibleItems.every(item => selectedKeys.has(getItemKey(item)));
+
+  const toggleSelectAllVisible = () => {
+    if (allVisibleSelected) {
+      setSelectedKeys(prev => {
+        const next = new Set(prev);
+        for (const item of visibleItems) {
+          next.delete(getItemKey(item));
+        }
+        return next;
+      });
+    } else {
+      setSelectedKeys(prev => {
+        const next = new Set(prev);
+        for (const item of visibleItems) {
+          next.add(getItemKey(item));
+        }
+        return next;
+      });
+    }
+  };
+
+  const toggleSelectItem = (item: OpeningSuggestionV5) => {
+    const key = getItemKey(item);
+    setSelectedKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
 
   return (
     <section className="border border-slate-200 rounded-xl p-5 space-y-4">
@@ -543,15 +611,56 @@ export default function OpeningReconciliation({
               <button
                 type="button"
                 disabled={busy || loading}
-                onClick={handleBatchApprove}
+                onClick={() => void handleBatchApprove(eligibleItems, "COMPATIBLE")}
                 className="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-bold shadow-xs transition-colors disabled:opacity-50"
               >
                 <CheckCheck className="w-4 h-4" />
-                <span>Aprovar em lote ({eligibleItems.length} compatíveis)</span>
+                <span>Aprovar compatíveis ({eligibleItems.length})</span>
               </button>
             )}
 
           </div>
+
+          {/* SELECTION BAR (Aparece quando há itens selecionados para aprovação simultânea) */}
+          {selectedItems.length > 0 && !batchProgress && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border-2 border-blue-500 bg-blue-50 p-3.5 shadow-md animate-in fade-in duration-200">
+              <div className="flex items-center gap-3">
+                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
+                  {selectedItems.length}
+                </span>
+                <div>
+                  <p className="text-sm font-bold text-blue-950">
+                    {selectedItems.length} {selectedItems.length === 1 ? "baixa selecionada" : "baixas selecionadas"} para aprovação simultânea
+                  </p>
+                  <p className="text-xs text-blue-700">
+                    Total selecionado: <strong className="font-semibold text-blue-900">{fmt(totalSelectedAmount)}</strong>
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy || loading}
+                  onClick={() => setSelectedKeys(new Set())}
+                  className="flex items-center gap-1 rounded-lg border border-blue-300 bg-white px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100 disabled:opacity-50 transition-colors"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  Desmarcar
+                </button>
+
+                <button
+                  type="button"
+                  disabled={busy || loading}
+                  onClick={() => void handleBatchApprove(selectedItems, "SELECTED")}
+                  className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                >
+                  <CheckCheck className="h-4 w-4" />
+                  Aprovar selecionados ({selectedItems.length})
+                </button>
+              </div>
+            </div>
+          )}
 
           {batchProgress && (
             <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 space-y-2">
@@ -574,27 +683,60 @@ export default function OpeningReconciliation({
             </div>
           )}
 
+          {/* LIST HEADER: SELECT ALL / ITEM COUNT */}
+          {!loading && visibleItems.length > 0 && (
+            <div className="flex items-center justify-between px-1 text-xs text-slate-500">
+              <label className="flex items-center gap-2 cursor-pointer select-none font-medium hover:text-slate-800">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={toggleSelectAllVisible}
+                  disabled={busy || loading}
+                  className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                />
+                <span>Selecionar todos ({visibleItems.length})</span>
+              </label>
+
+              <span>
+                Exibindo {visibleItems.length} de {filtered.length} {filtered.length === 1 ? "sugestão" : "sugestões"}
+              </span>
+            </div>
+          )}
+
           {!filtered.length && !loading && (
             <p className="text-sm text-slate-500">
               Nenhuma sugestao para este filtro.
             </p>
           )}
 
-          {filtered.slice(0, limit).map(item => {
-
+          {visibleItems.map(item => {
+            const key = getItemKey(item);
+            const isSelected = selectedKeys.has(key);
             const inv = rows[item.opening_index];
             const pay = paymentMap.get(item.payment_trans_id);
 
             return (
 
               <article
-                key={`${item.opening_index}:${item.payment_trans_id}`}
-                className="border rounded-xl p-4 space-y-3"
+                key={key}
+                className={`border rounded-xl p-4 space-y-3 transition-colors ${
+                  isSelected ? "border-blue-500 bg-blue-50/20 shadow-xs ring-1 ring-blue-400" : ""
+                }`}
               >
 
-                <div className="flex flex-wrap justify-between gap-2">
+                <div className="flex flex-wrap justify-between items-center gap-2">
 
-                  <b>{item.category.replace(/_/g, " ")}</b>
+                  <div className="flex items-center gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      disabled={busy || loading}
+                      onChange={() => toggleSelectItem(item)}
+                      className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                      title="Selecionar para aprovação simultânea"
+                    />
+                    <b className="text-sm text-slate-800">{item.category.replace(/_/g, " ")}</b>
+                  </div>
 
                   {item.ambiguous && (
                     <span className="text-amber-600 text-xs font-bold">
